@@ -1,0 +1,81 @@
+# MCAQ-YOLO Training Configuration - Fixed Version
+
+# Model settings
+model:
+  name: yolov8n  # Model variant
+  pretrained: true
+  teacher_path: yolov8n.pt
+  num_classes: 80  # Number of classes
+
+# Dataset settings - YOLOv8 format
+data:
+  path: /path/to/dataset  # Root path
+  train: images/train  # Relative to path
+  val: images/val
+  test: images/test
+  
+  # Class names (COCO example)
+  names:
+    0: person
+    1: bicycle
+    2: car
+    # ... add all classes
+  
+  # Data parameters
+  img_size: 640
+  batch_size: 16
+  num_workers: 8
+  cache: False
+
+# Training hyperparameters
+epochs: 300
+batch_size: 16
+learning_rate: 0.001
+
+# Quantization settings
+quantization:
+  enabled: true
+  min_bits: 2
+  max_bits: 8
+  target_bits: 4.0
+  calibration_mode: percentile
+  per_channel: true
+  smooth_transitions: true
+
+# Curriculum learning settings
+curriculum:
+  enabled: true
+  type: exponential
+  warmup_epochs: 30
+  initial_complexity: 0.2
+  initial_temperature: 10.0
+  initial_bits: 8.0
+
+# Knowledge distillation
+distillation:
+  enabled: true
+  temperature: 4.0
+  alpha: 0.7
+
+# Optimizer settings
+optimizer:
+  type: adamw
+  weight_decay: 0.05
+  betas: [0.9, 0.999]
+
+# Learning rate scheduler
+scheduler:
+  type: cosine
+  eta_min: 0.00001
+
+# Training settings
+training:
+  grad_clip: 10.0
+  save_interval: 10
+  eval_interval: 5
+  amp: true  # Mixed precision training
+
+# Hardware settings
+device: cuda
+output_dir: outputs
+seed: 42
