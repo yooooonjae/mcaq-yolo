@@ -1,4 +1,5 @@
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>  // at::cuda::getCurrentCUDAStream
 #include <vector>
 
 // CUDA forward declaration

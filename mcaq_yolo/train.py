@@ -1,543 +1,759 @@
 """
-Training script for MCAQ-YOLO
+MCAQ-YOLO Training Module
+
+- Ultralytics YOLO backbone + MCAQ morphological complexity + bit allocation
+- Uses Ultralytics build_yolo_dataset + build_dataloader for full compatibility
 """
 
+from __future__ import annotations
+
+import argparse
 import os
+import inspect
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Dict, Any, Tuple, Optional
+
+import numpy as np
+import yaml
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
-import numpy as np
-from pathlib import Path
+from torch.cuda.amp import autocast, GradScaler
+from torch.utils.data import DataLoader, SubsetRandomSampler
 from tqdm import tqdm
-import yaml
-import argparse
-from datetime import datetime
-import json
-import warnings
-warnings.filterwarnings('ignore')
 
 from ultralytics import YOLO
-from models.mcaq_yolo import MCAQYOLO
-from core.curriculum import CurriculumScheduler, ComplexityBasedSampler
-from utils.dataset import ComplexityDataset, compute_dataset_complexity
-from utils.evaluation import evaluate_mcaq_yolo
-from utils.visualization import plot_training_curves, visualize_complexity_map
+from ultralytics.data.build import build_yolo_dataset, build_dataloader
+from ultralytics.cfg import DEFAULT_CFG
+
+from .models.mcaq_yolo import MCAQYOLO  # 네 레포의 MCAQ 모델
+from .core.curriculum import CurriculumScheduler
+from .utils.dataset import compute_dataset_complexity
 
 
 class Trainer:
     """
-    Main trainer class for MCAQ-YOLO
+    MCAQ-YOLO Trainer
+
+    - Ultralytics YOLO 학습 파이프라인을 최대한 그대로 유지
+    - build_yolo_dataset + build_dataloader 사용
+    - morphology / bit allocation / KD / curriculum 모두 여기서 관리
     """
-    
-    def __init__(self, config: dict):
-        """
-        Initialize trainer.
-        
-        Args:
-            config: Training configuration dictionary
-        """
+
+    def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.device = torch.device(config['device'])
-        self.output_dir = Path(config['output_dir'])
+        self.device = torch.device(config.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
+
+        # --------------------------
+        # 기본 설정
+        # --------------------------
+        # Paper Table X: total epochs = 300. (A default below warmup_epochs=20
+        # would keep the curriculum in Stage 1 forever — quantization would
+        # never activate; workflow finding [9].)
+        self.epochs: int = int(config.get("epochs", 300))
+        self.batch_size: int = int(config.get("batch_size", 128))
+        self.output_dir = Path(config.get("output_dir", "outputs/default_run"))
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Initialize tensorboard
-        self.writer = SummaryWriter(self.output_dir / 'tensorboard')
-        
-        # Training parameters
-        self.epochs = config['epochs']
-        self.batch_size = config['batch_size']
-        self.learning_rate = config['learning_rate']
-        self.save_interval = config.get('save_interval', 10)
-        self.eval_interval = config.get('eval_interval', 5)
-        
-        # Quantization parameters
-        self.min_bits = config['quantization']['min_bits']
-        self.max_bits = config['quantization']['max_bits']
-        self.target_bits = config['quantization']['target_bits']
-        
-        # Initialize model
-        self.model = self._init_model()
-        
-        # Initialize teacher model for distillation
-        self.teacher_model = self._init_teacher_model()
-        
-        # Initialize datasets
+
+        data_cfg = config.get("data", {})
+        self.data_cfg = data_cfg
+
+        self.num_workers: int = int(data_cfg.get("num_workers", 8))
+        self.imgsz: int = int(data_cfg.get("imgsz", data_cfg.get("img_size", 640)))
+
+        # --------------------------
+        # Teacher / Student 모델 설정
+        # --------------------------
+        model_cfg = config.get("model", {})
+        teacher_path = model_cfg.get("teacher_path", "yolov8n.pt")
+        num_classes = int(model_cfg.get("num_classes", 80))
+
+        # teacher 경로 절대경로로 변환
+        teacher_abs = teacher_path
+        if not os.path.isabs(teacher_abs):
+            project_root = Path(__file__).resolve().parents[1]
+            teacher_abs = str((project_root / teacher_path).resolve())
+
+        print(f"[MCAQ] Loaded teacher model from {teacher_abs}")
+        self.teacher_model = YOLO(teacher_abs).to(self.device)
+        self.teacher_model.eval()  # KD용
+
+        # --------------------------
+        # 학생(MCAQYOLO) 인스턴스 생성
+        #   → 실제 MCAQYOLO.__init__의 시그니처를 런타임에 읽어서
+        #     존재하는 인자만 골라 넘긴다.
+        # --------------------------
+        quant_cfg = config.get("quantization", {})
+        curriculum_cfg = config.get("curriculum", {})
+
+        # MCAQYOLO.__init__ 시그니처 조사
+        init_sig = inspect.signature(MCAQYOLO)
+        param_names = list(init_sig.parameters.keys())[1:]  # self 제외
+
+        kwargs = {}
+        # 자주 나오는 이름들을 대응
+        if "teacher_model" in param_names:
+            kwargs["teacher_model"] = self.teacher_model
+        if "backbone" in param_names or "base_model" in param_names or "yolo_model" in param_names:
+            # 여러 이름 중 하나만 쓰도록
+            if "backbone" in param_names:
+                kwargs["backbone"] = self.teacher_model
+            elif "base_model" in param_names:
+                kwargs["base_model"] = self.teacher_model
+            elif "yolo_model" in param_names:
+                kwargs["yolo_model"] = self.teacher_model
+
+        if "num_classes" in param_names or "nc" in param_names:
+            if "num_classes" in param_names:
+                kwargs["num_classes"] = num_classes
+            else:
+                kwargs["nc"] = num_classes
+
+        if "quant_cfg" in param_names or "quantization_cfg" in param_names:
+            if "quant_cfg" in param_names:
+                kwargs["quant_cfg"] = quant_cfg
+            else:
+                kwargs["quantization_cfg"] = quant_cfg
+
+        if "curriculum_cfg" in param_names or "curriculum" in param_names:
+            if "curriculum_cfg" in param_names:
+                kwargs["curriculum_cfg"] = curriculum_cfg
+            else:
+                kwargs["curriculum"] = curriculum_cfg
+
+        # Quantization / model settings 전달 (설정 재현성 — Table X 기본값 유지)
+        for key in ("min_bits", "max_bits", "target_bits", "grid_size", "bit_mapping", "normalize_complexity"):
+            if key in param_names and key in quant_cfg:
+                kwargs[key] = quant_cfg[key]
+        if "model_name" in param_names and model_cfg.get("name"):
+            kwargs["model_name"] = model_cfg["name"]
+        if "device" in param_names:
+            kwargs["device"] = str(self.device)
+
+        # 혹시 아무 매개변수도 매칭 안 되면, 인자 없이 한 번 시도
+        try:
+            if kwargs:
+                self.model = MCAQYOLO(**kwargs).to(self.device)
+            else:
+                self.model = MCAQYOLO().to(self.device)
+        except TypeError as e:
+            # 혹시라도 실패하면, 최소한 teacher_model만 positional로 넣어서 다시 시도
+            print(f"[MCAQ][WARN] MCAQYOLO init with kwargs failed: {e}")
+            try:
+                self.model = MCAQYOLO(self.teacher_model).to(self.device)
+            except Exception as e2:
+                raise RuntimeError(
+                    "MCAQYOLO 초기화에 실패했습니다. "
+                    "mcaq_yolo/models/mcaq_yolo.py 의 __init__ 시그니처를 확인해서 "
+                    "필요하면 Trainer 코드를 맞춰야 합니다."
+                ) from e2
+
+        # --------------------------
+        # Dataset / Dataloader
+        # --------------------------
         self.train_dataset, self.val_dataset = self._init_datasets()
-        
-        # Compute complexity scores
+        self.train_loader, self.val_loader = self._init_dataloaders()
+
+        print(
+            f"[MCAQ] Datasets initialized: "
+            f"train={len(self.train_dataset)} samples, val={len(self.val_dataset)} samples"
+        )
+
+        # --------------------------
+        # Complexity scores (커리큘럼용)
+        # --------------------------
+        self.complexity_scores: Optional[torch.Tensor] = None
+        self.complexity_path = self.output_dir / "complexity_scores.npy"
         self.complexity_scores = self._compute_complexity_scores()
-        
-        # Initialize curriculum
+
+        # --------------------------
+        # Optimizer & Scheduler
+        # --------------------------
+        lr = float(config.get("learning_rate", 1e-3))
+        optim_cfg = config.get("optimizer", {})
+        opt_type = optim_cfg.get("type", "adamw").lower()
+
+        if opt_type == "adamw":
+            self.optimizer = optim.AdamW(
+                self.model.parameters(),
+                lr=lr,
+                weight_decay=float(optim_cfg.get("weight_decay", 0.05)),
+                betas=tuple(optim_cfg.get("betas", [0.9, 0.999])),
+            )
+        else:
+            self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
+
+        sched_cfg = config.get("scheduler", {})
+        sched_type = sched_cfg.get("type", "cosine").lower()
+        # Paper Table X: LR warmup = 5 epochs (distinct from the curriculum's
+        # Twarm=20 — this is the optimizer LR ramp, not the data curriculum)
+        warmup_epochs = int(sched_cfg.get("warmup_epochs", 5))
+
+        if sched_type == "cosine":
+            # Main scheduler: Cosine Annealing
+            main_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer,
+                T_max=self.epochs - warmup_epochs,
+                eta_min=float(sched_cfg.get("eta_min", 1e-6)),
+            )
+
+            if warmup_epochs > 0:
+                # Paper Table X: warmup LR 1e-5 with base LR 1e-3 => start_factor = 0.01
+                warmup_scheduler = optim.lr_scheduler.LinearLR(
+                    self.optimizer,
+                    start_factor=0.01,
+                    end_factor=1.0,
+                    total_iters=warmup_epochs,
+                )
+                # Combine warmup + main scheduler
+                self.scheduler = optim.lr_scheduler.SequentialLR(
+                    self.optimizer,
+                    schedulers=[warmup_scheduler, main_scheduler],
+                    milestones=[warmup_epochs],
+                )
+            else:
+                self.scheduler = main_scheduler
+        else:
+            self.scheduler = None
+
+        # --------------------------
+        # Mixed precision
+        # --------------------------
+        self.use_amp = bool(config.get("training", {}).get("amp", True))
+        self.scaler = GradScaler(enabled=self.use_amp)
+
+        # distillation, curriculum 설정
+        self.distill_cfg = config.get("distillation", {})
+        self.curriculum_cfg = config.get("curriculum", {})
+
+        # --------------------------
+        # Curriculum scheduler — single source of truth for the 3-stage schedule
+        # (paper Fig.3 / Algorithm 3 / Table X). Stage boundaries default to the
+        # paper's 20/50; temperature anneals 1+9*exp(-5t/T) with T = total epochs.
+        # --------------------------
         self.curriculum = CurriculumScheduler(
-            warmup_epochs=config['curriculum']['warmup_epochs'],
+            warmup_epochs=int(self.curriculum_cfg.get("warmup_epochs", 20)),
+            transition_epochs=int(self.curriculum_cfg.get("transition_epochs", 50)),
             total_epochs=self.epochs,
-            initial_complexity=config['curriculum']['initial_complexity'],
-            initial_temperature=config['curriculum']['initial_temperature'],
-            curriculum_type=config['curriculum']['type']
+            initial_complexity=float(self.curriculum_cfg.get("initial_complexity", 0.2)),
+            initial_temperature=float(self.curriculum_cfg.get("initial_temperature", 10.0)),
+            lambda_smooth=float(self.curriculum_cfg.get("lambda_smooth", 0.1)),
         )
-        
-        # Initialize optimizer and scheduler
-        self.optimizer = self._init_optimizer()
-        self.scheduler = self._init_scheduler()
-        
-        # Training state
-        self.current_epoch = 0
-        self.best_map = 0
-        self.training_history = {
-            'loss': [],
-            'mAP': [],
-            'avg_bits': [],
-            'temperature': [],
-            'learning_rate': []
-        }
-    
-    def _init_model(self) -> nn.Module:
-        """Initialize MCAQ-YOLO model."""
-        model = MCAQYOLO(
-            model_name=self.config['model']['name'],
-            pretrained=self.config['model']['pretrained'],
-            min_bits=self.min_bits,
-            max_bits=self.max_bits,
-            target_bits=self.target_bits,
-            device=self.device
+
+        # Raw teacher nn.Module (the YOLO wrapper post-processes outputs; KD needs
+        # the raw Detect-head maps)
+        self.teacher_module = self.teacher_model.model
+        self.teacher_module.eval()
+        for p in self.teacher_module.parameters():
+            p.requires_grad = False
+
+        # Feature-level KD (paper Sec IV-E: LKD uses logit-level AND feature-level
+        # matching): capture the teacher's FP32 C3/C4/C5 features at the same
+        # backbone indices the student quantizes (same architecture assumed;
+        # shape-checked before use).
+        self._teacher_feats: Dict[int, torch.Tensor] = {}
+        try:
+            t_layers = list(self.teacher_module.model)
+            for idx in getattr(self.model, "backbone_out_indices", []):
+                if 0 <= idx < len(t_layers):
+                    t_layers[idx].register_forward_hook(self._make_teacher_hook(idx))
+        except Exception as e:
+            print(f"[MCAQ][WARN] teacher feature hooks unavailable: {e}")
+
+    # ------------------------------------------------------------------
+    # Dataset / DataLoader
+    # ------------------------------------------------------------------
+    def _build_ultra_cfg(self) -> SimpleNamespace:
+        """
+        Ultralytics build_yolo_dataset에 넘겨줄 cfg(SimpleNamespace)를 구성.
+
+        - Ultralytics DEFAULT_CFG를 기본으로 사용
+        - 필요한 필드를 덮어쓴다.
+        """
+        # Start with DEFAULT_CFG as base (contains all required fields)
+        import copy
+        base = copy.deepcopy(vars(DEFAULT_CFG))
+
+        # Override with our custom settings
+        base["task"] = "detect"
+        base["mode"] = "train"
+        base["imgsz"] = self.imgsz
+        base["batch"] = self.batch_size
+        base["workers"] = self.num_workers
+        base["device"] = str(self.device)
+
+        # YOLO 객체에 overrides가 있으면 일부 덮어쓰기
+        if hasattr(self.teacher_model, "overrides") and isinstance(self.teacher_model.overrides, dict):
+            for key, val in self.teacher_model.overrides.items():
+                if key in base:
+                    base[key] = val
+
+        return SimpleNamespace(**base)
+
+    def _resolve_data_yaml(self) -> Tuple[str, Dict[str, Any]]:
+        """
+        config['data']에서 yaml_path (혹은 ppe_yaml 등)를 찾아서 반환.
+
+        Returns:
+            Tuple of (yaml_path, data_dict)
+        """
+        data_cfg = self.data_cfg
+        yaml_path = data_cfg.get("yaml_path", None)
+
+        if yaml_path is None:
+            yaml_path = data_cfg.get("ppe_yaml", None) or data_cfg.get("coco_yaml", None)
+
+        if yaml_path is None:
+            raise FileNotFoundError(
+                "Dataset yaml_path not provided in config['data']. "
+                "예: config['data']['yaml_path'] = '/path/to/dataset_ppe.yaml'"
+            )
+
+        yaml_path = str(Path(yaml_path).resolve())
+        if not os.path.exists(yaml_path):
+            raise FileNotFoundError(f"Dataset yaml file not found: {yaml_path}")
+
+        # Load yaml as dictionary
+        with open(yaml_path, 'r') as f:
+            data_dict = yaml.safe_load(f)
+
+        # Ensure 'path' is absolute
+        if 'path' in data_dict and not os.path.isabs(data_dict['path']):
+            yaml_dir = os.path.dirname(yaml_path)
+            data_dict['path'] = os.path.abspath(os.path.join(yaml_dir, data_dict['path']))
+
+        return yaml_path, data_dict
+
+    def _init_datasets(self):
+        """
+        Ultralytics YOLODataset을 이용해 학습/검증용 Dataset을 생성.
+        """
+        yaml_path, data_dict = self._resolve_data_yaml()
+        cfg_ns = self._build_ultra_cfg()
+
+        data_cfg = self.data_cfg
+        train_img_rel = data_cfg.get("train", None)
+        val_img_rel = data_cfg.get("val", None)
+
+        if train_img_rel is None or val_img_rel is None:
+            raise ValueError(
+                "config['data'] 안에 'train', 'val' 경로가 필요합니다.\n"
+                "예: 'train': 'train/images', 'val': 'val/images'"
+            )
+
+        # Build absolute paths from data_dict['path']
+        dataset_root = data_dict.get("path", "")
+        train_img_path = os.path.join(dataset_root, train_img_rel)
+        val_img_path = os.path.join(dataset_root, val_img_rel)
+
+        train_dataset = build_yolo_dataset(
+            cfg=cfg_ns,
+            img_path=train_img_path,
+            batch=self.batch_size,
+            data=data_dict,  # Pass dict, not string
+            mode="train",
+            rect=False,
+            stride=32,
         )
-        return model.to(self.device)
-    
-    def _init_teacher_model(self) -> nn.Module:
-        """Initialize teacher model for knowledge distillation."""
-        if self.config.get('distillation', {}).get('enabled', True):
-            teacher = YOLO(self.config['model']['teacher_path'])
-            teacher.model.eval()
-            for param in teacher.model.parameters():
-                param.requires_grad = False
-            return teacher.model.to(self.device)
-        return None
-    
-    # train.py의 _init_datasets 메서드 수정
 
-def _init_datasets(self):
-    """Initialize training and validation datasets."""
-    # Use YOLOv8's dataset format
-    from ultralytics.data import build_dataloader, build_yolo_dataset
-    
-    # For YOLOv8 compatibility
-    train_dataset = build_yolo_dataset(
-        cfg=self.config,
-        img_path=self.config['data']['train_path'],
-        batch=self.batch_size,
-        augment=True,
-        cache=False,
-        data=self.config['data']
-    )
-    
-    val_dataset = build_yolo_dataset(
-        cfg=self.config,
-        img_path=self.config['data']['val_path'],
-        batch=self.batch_size,
-        augment=False,
-        cache=False,
-        data=self.config['data']
-    )
-    
-    return train_dataset, val_dataset
+        val_dataset = build_yolo_dataset(
+            cfg=cfg_ns,
+            img_path=val_img_path,
+            batch=self.batch_size,
+            data=data_dict,  # Pass dict, not string
+            mode="val",
+            rect=True,
+            stride=32,
+        )
 
-def train_epoch(self, epoch: int) -> dict:
-    """Train for one epoch."""
-    self.model.train()
-    
-    # Get curriculum parameters
-    curr_params = self.curriculum.get_current_params()
-    complexity_threshold = curr_params['complexity_threshold']
-    temperature = curr_params['temperature']
-    loss_weights = self.curriculum.get_loss_weights(epoch)
-    
-    # Create dataloader
-    from ultralytics.data import build_dataloader
-    
-    dataloader = build_dataloader(
-        dataset=self.train_dataset,
-        batch_size=self.batch_size,
-        workers=self.config['data']['num_workers'],
-        shuffle=True
-    )[0]  # build_dataloader returns tuple
-    
-    # ... rest of the method remains the same
-    
-    def _compute_complexity_scores(self) -> np.ndarray:
-        """Compute or load complexity scores for curriculum learning."""
-        cache_path = self.output_dir / 'complexity_scores.npy'
-        
-        if cache_path.exists():
-            print(f"Loading complexity scores from {cache_path}")
-            return np.load(cache_path)
-        
-        print("Computing complexity scores for curriculum learning...")
-        scores = compute_dataset_complexity(
-            self.train_dataset,
+        return train_dataset, val_dataset
+
+    def _init_dataloaders(self):
+        """
+        Ultralytics 전용 build_dataloader를 사용해서
+        InfiniteDataLoader + 전용 collate_fn을 그대로 쓰도록 설정.
+        """
+        train_loader = build_dataloader(
+            dataset=self.train_dataset,
+            batch=self.batch_size,
+            workers=self.num_workers,
+            shuffle=True,
+            rank=-1,  # 단일 GPU
+        )
+
+        val_loader = build_dataloader(
+            dataset=self.val_dataset,
+            batch=self.batch_size,
+            workers=self.num_workers,
+            shuffle=False,
+            rank=-1,
+        )
+
+        return train_loader, val_loader
+
+    # ------------------------------------------------------------------
+    # Complexity (커리큘럼용)
+    # ------------------------------------------------------------------
+    def _compute_complexity_scores(self) -> torch.Tensor:
+        """
+        Morphological complexity score를 전체 train dataset에 대해 계산.
+        이미 저장된 npy가 있으면 로드.
+        """
+        if self.complexity_path.exists():
+            print(f"[MCAQ] Loading complexity scores from {self.complexity_path}")
+            import numpy as np
+
+            scores_np = np.load(self.complexity_path)
+            scores = torch.from_numpy(scores_np).float()
+            return scores.to(self.device)
+
+        print("[MCAQ] Computing complexity scores for curriculum learning...")
+        # Algorithm 3 line 1: SortByComplexity uses the unified morphological
+        # complexity C(x) (Eq.8) — pass the model so its analyzer scores images;
+        # the edge-density path remains as a fallback when model is None.
+        scores_np = compute_dataset_complexity(
+            dataset=self.train_dataset,
             model=self.model,
             batch_size=self.batch_size,
             device=str(self.device),
-            save_path=str(cache_path)
+            save_path=str(self.complexity_path),
         )
-        
+        scores = torch.from_numpy(scores_np).float().to(self.device)
         return scores
-    
-    def _init_optimizer(self) -> torch.optim.Optimizer:
-        """Initialize optimizer."""
-        param_groups = [
-            {'params': self.model.model.parameters(), 'lr': self.learning_rate},
-            {'params': self.model.complexity_analyzer.parameters(), 'lr': self.learning_rate * 0.1},
-            {'params': self.model.bit_mapper.parameters(), 'lr': self.learning_rate * 0.1}
-        ]
-        
-        optimizer_type = self.config['optimizer']['type']
-        
-        if optimizer_type == 'adamw':
-            optimizer = optim.AdamW(
-                param_groups,
-                weight_decay=self.config['optimizer']['weight_decay'],
-                betas=(0.9, 0.999)
-            )
-        elif optimizer_type == 'sgd':
-            optimizer = optim.SGD(
-                param_groups,
-                momentum=0.9,
-                weight_decay=self.config['optimizer']['weight_decay']
-            )
-        else:
-            raise ValueError(f"Unknown optimizer: {optimizer_type}")
-        
-        return optimizer
-    
-    def _init_scheduler(self):
-        """Initialize learning rate scheduler."""
-        scheduler_type = self.config['scheduler']['type']
-        
-        if scheduler_type == 'cosine':
-            scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer,
-                T_max=self.epochs,
-                eta_min=self.learning_rate * 0.01
-            )
-        elif scheduler_type == 'step':
-            scheduler = optim.lr_scheduler.StepLR(
-                self.optimizer,
-                step_size=self.config['scheduler']['step_size'],
-                gamma=self.config['scheduler']['gamma']
-            )
-        else:
-            scheduler = None
-        
-        return scheduler
-    
-    def train_epoch(self, epoch: int) -> dict:
+
+    def _make_teacher_hook(self, idx: int):
+        """Store the teacher's feature map at backbone layer `idx` (FP32, frozen)."""
+        def hook(module, inputs, output):
+            if torch.is_tensor(output):
+                self._teacher_feats[idx] = output
+        return hook
+
+    def _get_curriculum_temperature(self, epoch: int) -> float:
         """
-        Train for one epoch.
-        
-        Args:
-            epoch: Current epoch number
-            
-        Returns:
-            Dictionary of epoch metrics
+        Algorithm 3 line 10: alpha_t = 1 + 9*exp(-5t/T) — delegated to the
+        CurriculumScheduler (single source of truth). Final temperature is 1.0
+        (paper Table X), at which point bit allocation is fully adaptive.
+        """
+        if not self.curriculum_cfg.get("enabled", True):
+            return 1.0
+        return float(self.curriculum.get_temperature(epoch))
+
+    def _build_curriculum_loader(self, tau_t: float):
+        """
+        Algorithm 3 line 9: D_t = {(x,y) in D_sorted : C(x) <= tau_t}.
+
+        Builds a DataLoader restricted to samples whose precomputed complexity
+        score is below the epoch's threshold. Falls back to the easiest samples
+        when the threshold leaves too few. Returns the full train_loader once
+        tau_t reaches 1.0 (post warm-up).
+        """
+        if tau_t >= 1.0 or self.complexity_scores is None:
+            return self.train_loader
+
+        scores = self.complexity_scores.detach().cpu().numpy()
+        idx = np.where(scores <= tau_t)[0]
+
+        min_needed = max(self.batch_size, 64)
+        if len(idx) < min_needed:
+            # Algorithm 3 sorts by complexity — fall back to the easiest samples
+            idx = np.argsort(scores)[:min_needed]
+
+        collate = getattr(self.train_dataset, "collate_fn", None)
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.batch_size,
+            sampler=SubsetRandomSampler(idx.tolist()),
+            num_workers=self.num_workers,
+            collate_fn=collate,
+            pin_memory=True,
+            drop_last=False,
+        )
+
+    # ------------------------------------------------------------------
+    # Train / Eval Loop
+    # ------------------------------------------------------------------
+    def train_epoch(self, epoch: int) -> Dict[str, float]:
+        """
+        한 epoch 학습.
         """
         self.model.train()
-        
-        # Get curriculum parameters
-        curr_params = self.curriculum.get_current_params()
-        complexity_threshold = curr_params['complexity_threshold']
-        temperature = curr_params['temperature']
-        loss_weights = self.curriculum.get_loss_weights(epoch)
-        
-        # Create dataloader with curriculum sampling
-        if self.config['curriculum']['enabled']:
-            sampler = ComplexityBasedSampler(
-                self.train_dataset,
-                self.complexity_scores,
-                self.batch_size
-            )
-            subset = sampler.get_curriculum_subset(complexity_threshold)
-            dataloader = DataLoader(
-                subset,
-                batch_size=self.batch_size,
-                shuffle=True,
-                num_workers=self.config['data']['num_workers'],
-                pin_memory=True
-            )
-        else:
-            dataloader = DataLoader(
-                self.train_dataset,
-                batch_size=self.batch_size,
-                shuffle=True,
-                num_workers=self.config['data']['num_workers'],
-                pin_memory=True
-            )
-        
-        # Training metrics
-        epoch_losses = []
-        epoch_metrics = {
-            'loss_det': [],
-            'loss_bit': [],
-            'loss_smooth': [],
-            'loss_kd': [],
-            'avg_bits': []
-        }
-        
-        # Progress bar
-        pbar = tqdm(dataloader, desc=f'Epoch {epoch+1}/{self.epochs}')
-        
+        self.teacher_module.eval()
+
+        # --- 3-stage curriculum state for this epoch (paper Fig.3 / Algorithm 3) ---
+        stage = self.curriculum.get_stage(epoch)
+        temp = self._get_curriculum_temperature(epoch)
+        tau_t = self.curriculum.get_complexity_threshold(epoch)
+        loss_weights = self.curriculum.get_loss_weights(epoch)  # lambda1(t) annealed
+        # Codex review #1 (faithful): the curriculum's 8->4 bit-target schedule
+        # existed but was never wired into Lbit — a fixed target of 4 from
+        # epoch 1 exerts maximal collapse pressure exactly when Ldet is absent
+        # (Stage 1 bypasses quantization).
+        target_bits_t = float(self.curriculum.get_target_bits(epoch))
+        # Stage 1: high-precision warm-up — quantization bypassed (FP16/AMP forward)
+        quantize = stage >= 2
+
+        kd_enabled = bool(self.distill_cfg.get("enabled", True))
+
+        # Algorithm 3 line 9: restrict this epoch's data to C(x) <= tau_t
+        epoch_loader = self._build_curriculum_loader(tau_t)
+
+        # Accumulators for metrics
+        total_loss = 0.0
+        total_det_loss = 0.0
+        total_bit_loss = 0.0
+        total_smooth_loss = 0.0
+        total_avg_bits = 0.0
+        bit_counts = {2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0, 8: 0}
+        n_batches = 0
+
+        # Create progress bar
+        pbar = tqdm(
+            epoch_loader,
+            desc=f"Epoch {epoch}/{self.epochs} [S{stage}]",
+            unit="batch",
+            ncols=150,
+            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}'
+        )
+
         for batch_idx, batch in enumerate(pbar):
-            # Get images and targets
-            images = batch['img'].to(self.device)
-            targets = batch['labels'].to(self.device)
-            
-            # Teacher forward pass
-            teacher_outputs = None
-            if self.teacher_model is not None:
-                with torch.no_grad():
-                    teacher_outputs = self.teacher_model(images)
-            
-            # Student forward pass
-            outputs, aux_info = self.model(images, temperature)
-            
-            # Compute loss
-            loss, loss_dict = self.model.loss_fn(
-                outputs,
-                targets,
-                aux_info,
-                teacher_outputs,
-                self.model.bit_mapper,
-                loss_weights
-            )
-            
-            # Backward pass
-            self.optimizer.zero_grad()
-            loss.backward()
-            
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(),
-                max_norm=self.config['training']['grad_clip']
-            )
-            
-            self.optimizer.step()
-            
-            # Update metrics
-            epoch_losses.append(loss.item())
-            for key in epoch_metrics:
-                if key in loss_dict:
-                    epoch_metrics[key].append(loss_dict[key].item())
-                elif key == 'avg_bits' and 'avg_bits' in aux_info:
-                    epoch_metrics[key].append(aux_info['avg_bits'].item())
-            
+            imgs = batch["img"].to(self.device, non_blocking=True)
+            # Ensure images are float and normalized to 0-1
+            if imgs.dtype == torch.uint8:
+                imgs = imgs.float() / 255.0
+            elif imgs.dtype != torch.float32 and imgs.dtype != torch.float16:
+                imgs = imgs.float()
+            self.optimizer.zero_grad(set_to_none=True)
+
+            with autocast(enabled=self.use_amp):
+                # 학생 모델 forward (complexity + bit allocation 포함;
+                # Stage 1에서는 quantize=False로 고정밀 warm-up)
+                outputs, aux_info = self.model(imgs, temp, quantize=quantize)
+
+                # FP32 teacher raw outputs for KD (paper Eq.20: L includes
+                # lambda3 * LKD — composed inside the loss, not alpha-blended).
+                # autocast is explicitly disabled so the teacher really runs in
+                # FP32 even when AMP is on (paper: FP32 teacher).
+                teacher_out = None
+                if kd_enabled:
+                    with torch.no_grad(), autocast(enabled=False):
+                        self._teacher_feats.clear()
+                        teacher_out = self.teacher_module(imgs.float())
+
+                    # Feature-level KD: student's quantized C3/C4/C5 vs the
+                    # teacher's FP32 features at the same layers
+                    feat_losses = []
+                    for li, fq in zip(
+                        aux_info.get('feature_layers', []),
+                        aux_info.get('quantized_features', []),
+                    ):
+                        tf = self._teacher_feats.get(li)
+                        if tf is not None and tf.shape == fq.shape:
+                            feat_losses.append(
+                                F.mse_loss(fq.float(), tf.detach().float())
+                            )
+                    if feat_losses:
+                        aux_info['kd_feature_loss'] = sum(feat_losses) / len(feat_losses)
+
+                # Eq.(20): L = Ldet + lambda1(t) Lbit + lambda2 Lsmooth
+                #            + lambda3 LKD + lambda4 Lreg
+                # lambda4 applies to the bit-mapping network weights only.
+                loss, loss_dict = self.model.loss_fn(
+                    outputs,
+                    batch,
+                    aux_info,
+                    teacher_outputs=teacher_out,
+                    model_params=self.model.bit_mapper,
+                    loss_weights=loss_weights,
+                    target_bits=target_bits_t,
+                )
+                loss_det = loss_dict.get('loss_det', loss)
+
+            if self.use_amp:
+                self.scaler.scale(loss).backward()
+                # Paper Table X: gradient clipping = 1.0 (unscale before clipping under AMP)
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                loss.backward()
+                # Paper Table X: gradient clipping = 1.0
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+
+            # Paper Eq.(18): Wi <- |Wi| — re-project the bit-mapping network onto
+            # non-negative weights after every update to keep f(C) monotone
+            self.model.bit_mapper.enforce_weight_constraints()
+
+            # Accumulate metrics
+            total_loss += loss.detach().item()
+            total_det_loss += loss_dict.get('loss_det', torch.tensor(0.0)).detach().item() if isinstance(loss_dict.get('loss_det'), torch.Tensor) else loss_dict.get('loss_det', 0.0)
+            total_bit_loss += loss_dict.get('loss_bit', torch.tensor(0.0)).detach().item() if isinstance(loss_dict.get('loss_bit'), torch.Tensor) else loss_dict.get('loss_bit', 0.0)
+            total_smooth_loss += loss_dict.get('loss_smooth', torch.tensor(0.0)).detach().item() if isinstance(loss_dict.get('loss_smooth'), torch.Tensor) else loss_dict.get('loss_smooth', 0.0)
+
+            # Track bit allocation
+            avg_bits = aux_info.get('avg_bits', 0.0)
+            if isinstance(avg_bits, torch.Tensor):
+                avg_bits = avg_bits.item()
+            total_avg_bits += avg_bits
+
+            # Count bit distribution from bit_map (single map or per-scale list).
+            # Training-time maps are continuous (fractional-bit quantization) —
+            # round for the histogram.
+            if 'bit_map' in aux_info:
+                bit_map = aux_info['bit_map']
+                maps = bit_map if isinstance(bit_map, (list, tuple)) else [bit_map]
+                for m in maps:
+                    if isinstance(m, torch.Tensor):
+                        mr = torch.round(m.detach())
+                        for bits in range(2, 9):
+                            bit_counts[bits] += (mr == bits).sum().item()
+
+            n_batches += 1
+
             # Update progress bar
+            current_avg_bits = total_avg_bits / n_batches if n_batches > 0 else 0
             pbar.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'bits': f'{aux_info["avg_bits"].item():.2f}',
-                'temp': f'{temperature:.2f}'
+                'loss': f'{total_loss/n_batches:.4f}',
+                'det': f'{total_det_loss/n_batches:.4f}',
+                'bits': f'{current_avg_bits:.2f}',
+                'temp': f'{temp:.2f}',
+                'lr': f'{self.optimizer.param_groups[0]["lr"]:.6f}'
             })
-            
-            # Log to tensorboard
-            global_step = epoch * len(dataloader) + batch_idx
-            self.writer.add_scalar('train/loss', loss.item(), global_step)
-            self.writer.add_scalar('train/avg_bits', aux_info['avg_bits'].item(), global_step)
-        
-        # Compute epoch averages
-        metrics = {
-            'loss': np.mean(epoch_losses),
-            **{key: np.mean(values) for key, values in epoch_metrics.items() if values}
+
+        pbar.close()
+
+        # Calculate averages
+        avg_loss = total_loss / max(1, n_batches)
+        avg_det_loss = total_det_loss / max(1, n_batches)
+        avg_bit_loss = total_bit_loss / max(1, n_batches)
+        avg_smooth_loss = total_smooth_loss / max(1, n_batches)
+        avg_bits = total_avg_bits / max(1, n_batches)
+
+        # Print epoch summary with bit distribution
+        total_tiles = sum(bit_counts.values())
+        print(f"\n{'='*80}")
+        print(f"Epoch {epoch} Summary:")
+        print(f"  Total Loss: {avg_loss:.4f} | Det Loss: {avg_det_loss:.4f} | Bit Loss: {avg_bit_loss:.6f} | Smooth Loss: {avg_smooth_loss:.6f}")
+        print(f"  Average Bits: {avg_bits:.2f} | Temperature: {temp:.2f}")
+        if total_tiles > 0:
+            print(f"  Bit Distribution:")
+            for bits in range(2, 9):
+                count = bit_counts[bits]
+                pct = (count / total_tiles) * 100
+                bar = '█' * int(pct / 2)
+                print(f"    {bits}-bit: {bar} {pct:.1f}% ({count:,})")
+        print(f"{'='*80}\n")
+
+        return {
+            "loss": avg_loss,
+            "det_loss": avg_det_loss,
+            "bit_loss": avg_bit_loss,
+            "smooth_loss": avg_smooth_loss,
+            "avg_bits": avg_bits,
+            "temperature": temp
         }
-        
-        return metrics
-    
-    def validate(self) -> dict:
+
+    @torch.no_grad()
+    def evaluate(self, quantize: bool = True) -> Dict[str, float]:
         """
-        Run validation.
-        
-        Returns:
-            Dictionary of validation metrics
+        간단한 validation 루프 (mAP 등은 별도 모듈에서 측정해도 되고,
+        여기서는 placeholder 형태로 둠)
+
+        Args:
+            quantize: 학습 단계와 동일한 양자화 상태로 평가 (Stage 1 warm-up
+                동안에는 False — 학습/검증 불일치 방지, workflow finding [12])
         """
         self.model.eval()
-        
-        dataloader = DataLoader(
-            self.val_dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=self.config['data']['num_workers'],
-            pin_memory=True
-        )
-        
-        # Run evaluation
-        metrics = evaluate_mcaq_yolo(
-            self.model,
-            dataloader,
-            device=str(self.device),
-            compute_complexity=True
-        )
-        
-        self.model.train()
-        return metrics
-    
-    def save_checkpoint(self, epoch: int, metrics: dict):
-        """Save model checkpoint."""
-        checkpoint = {
-            'epoch': epoch,
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
-            'metrics': metrics,
-            'config': self.config,
-            'training_history': self.training_history
-        }
-        
-        # Save latest checkpoint
-        checkpoint_path = self.output_dir / 'latest.pth'
-        torch.save(checkpoint, checkpoint_path)
-        
-        # Save best checkpoint
-        if metrics.get('mAP@0.5', 0) > self.best_map:
-            self.best_map = metrics['mAP@0.5']
-            best_path = self.output_dir / 'best.pth'
-            torch.save(checkpoint, best_path)
-            print(f"New best model saved with mAP@0.5: {self.best_map:.4f}")
-        
-        # Save periodic checkpoint
-        if epoch % self.save_interval == 0:
-            periodic_path = self.output_dir / f'epoch_{epoch}.pth'
-            torch.save(checkpoint, periodic_path)
-    
-    def train(self):
-        """Main training loop."""
+        total_loss = 0.0
+        n_batches = 0
+
+        for batch in self.val_loader:
+            imgs = batch["img"].to(self.device, non_blocking=True)
+            # Ensure images are float and normalized to 0-1
+            if imgs.dtype == torch.uint8:
+                imgs = imgs.float() / 255.0
+            elif imgs.dtype != torch.float32 and imgs.dtype != torch.float16:
+                imgs = imgs.float()
+
+            with autocast(enabled=self.use_amp):
+                outputs, aux_info = self.model(imgs, temperature=1.0, quantize=quantize)
+                loss, loss_dict = self.model.loss_fn(
+                    outputs,
+                    batch,
+                    aux_info,
+                    model_params=self.model.bit_mapper,
+                )
+                loss_det = loss_dict.get('loss_det', loss)
+
+            total_loss += loss_det.detach().item()
+            n_batches += 1
+
+        avg_loss = total_loss / max(1, n_batches)
+        return {"val_loss": avg_loss}
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def train(self) -> nn.Module:
+        """
+        전체 학습 루프.
+        """
         print(f"Starting training for {self.epochs} epochs...")
         print(f"Output directory: {self.output_dir}")
-        
-        for epoch in range(self.epochs):
-            self.current_epoch = epoch
-            
-            # Update curriculum
-            self.curriculum.step()
-            
-            # Train epoch
+
+        best_val = float("inf")
+        best_weights_path = self.output_dir / "best.pt"
+
+        for epoch in range(1, self.epochs + 1):
             train_metrics = self.train_epoch(epoch)
-            
-            # Validation
-            val_metrics = {}
-            if epoch % self.eval_interval == 0:
-                print("\nRunning validation...")
-                val_metrics = self.validate()
-            
-            # Update learning rate
-            if self.scheduler:
+            # Validate under the same quantization regime as training
+            # (Stage 1 warm-up: high precision)
+            val_metrics = self.evaluate(
+                quantize=self.curriculum.get_stage(epoch) >= 2
+            )
+
+            if self.scheduler is not None:
                 self.scheduler.step()
-            
-            # Log metrics
-            current_lr = self.optimizer.param_groups[0]['lr']
-            print(f"\nEpoch {epoch+1}/{self.epochs}")
-            print(f"  Train Loss: {train_metrics['loss']:.4f}")
-            print(f"  Avg Bits: {train_metrics.get('avg_bits', 0):.2f}")
-            print(f"  Learning Rate: {current_lr:.6f}")
-            
-            if val_metrics:
-                print(f"  Val mAP@0.5: {val_metrics.get('mAP@0.5', 0):.4f}")
-                print(f"  Val mAP@0.5:0.95: {val_metrics.get('mAP@0.5:0.95', 0):.4f}")
-            
-            # Update training history
-            self.training_history['loss'].append(train_metrics['loss'])
-            self.training_history['avg_bits'].append(train_metrics.get('avg_bits', 0))
-            self.training_history['learning_rate'].append(current_lr)
-            
-            if val_metrics:
-                self.training_history['mAP'].append(val_metrics.get('mAP@0.5', 0))
-            
-            # Save checkpoint
-            self.save_checkpoint(epoch, {**train_metrics, **val_metrics})
-            
-            # Log to tensorboard
-            self.writer.add_scalar('epoch/train_loss', train_metrics['loss'], epoch)
-            self.writer.add_scalar('epoch/avg_bits', train_metrics.get('avg_bits', 0), epoch)
-            self.writer.add_scalar('epoch/learning_rate', current_lr, epoch)
-            
-            if val_metrics:
-                self.writer.add_scalar('epoch/val_map50', val_metrics.get('mAP@0.5', 0), epoch)
-        
-        print("\nTraining completed!")
-        
-        # Save final model
-        final_path = self.output_dir / 'final.pth'
-        torch.save(self.model.state_dict(), final_path)
-        
-        # Plot training curves
-        fig = plot_training_curves(self.training_history)
-        fig.savefig(self.output_dir / 'training_curves.png')
-        
-        # Save training history
-        with open(self.output_dir / 'training_history.json', 'w') as f:
-            json.dump(self.training_history, f, indent=4)
-        
-        self.writer.close()
-        
+
+            print(
+                f"Epoch {epoch}/{self.epochs} "
+                f"- loss: {train_metrics['loss']:.4f}, "
+                f"val_loss: {val_metrics['val_loss']:.4f}"
+            )
+
+            if val_metrics["val_loss"] < best_val:
+                best_val = val_metrics["val_loss"]
+                torch.save(self.model.state_dict(), best_weights_path)
+
+        print(f"[MCAQ] Training finished. Best val_loss={best_val:.4f}")
+        print(f"[MCAQ] Best weights saved to {best_weights_path}")
+
         return self.model
 
 
-def load_config(config_path: str) -> dict:
-    """Load configuration from YAML file."""
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
-    return config
+def main(argv: Optional[list] = None) -> None:
+    """
+    CLI entry point (`mcaq-yolo-train`): YAML config를 읽어 Trainer를 실행.
+    """
+    parser = argparse.ArgumentParser(description="MCAQ-YOLO training")
+    parser.add_argument("--config", required=True, help="Path to training config YAML")
+    parser.add_argument("--device", default=None, help="Override config device (cpu / cuda / mps)")
+    parser.add_argument("--output-dir", default=None, help="Override config output_dir")
+    args = parser.parse_args(argv)
+
+    with open(args.config, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f) or {}
+
+    if args.device is not None:
+        config["device"] = args.device
+    if args.output_dir is not None:
+        config["output_dir"] = args.output_dir
+
+    Trainer(config).train()
 
 
-def main():
-    """Main training function."""
-    parser = argparse.ArgumentParser(description='Train MCAQ-YOLO')
-    parser.add_argument('--config', type=str, default='configs/train_config.yaml',
-                       help='Path to training configuration file')
-    parser.add_argument('--device', type=str, default='cuda',
-                       help='Device to use for training')
-    parser.add_argument('--output-dir', type=str, default='outputs',
-                       help='Output directory for training results')
-    parser.add_argument('--resume', type=str, default=None,
-                       help='Path to checkpoint to resume from')
-    args = parser.parse_args()
-    
-    # Load configuration
-    config = load_config(args.config)
-    
-    # Override config with command line arguments
-    config['device'] = args.device
-    config['output_dir'] = args.output_dir
-    
-    # Create output directory with timestamp
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    config['output_dir'] = Path(config['output_dir']) / f'mcaq_yolo_{timestamp}'
-    config['output_dir'].mkdir(parents=True, exist_ok=True)
-    
-    # Save configuration
-    with open(config['output_dir'] / 'config.yaml', 'w') as f:
-        yaml.dump(config, f, default_flow_style=False)
-    
-    # Initialize trainer
-    trainer = Trainer(config)
-    
-    # Resume from checkpoint if specified
-    if args.resume:
-        checkpoint = torch.load(args.resume)
-        trainer.model.load_state_dict(checkpoint['model_state_dict'])
-        trainer.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        if trainer.scheduler and checkpoint['scheduler_state_dict']:
-            trainer.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        trainer.current_epoch = checkpoint['epoch']
-        trainer.training_history = checkpoint.get('training_history', {})
-        print(f"Resumed from checkpoint: {args.resume}")
-        print(f"Starting from epoch {trainer.current_epoch}")
-    
-    # Train model
-    model = trainer.train()
-    
-    print("Training completed successfully!")
-    print(f"Results saved to: {config['output_dir']}")
-
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

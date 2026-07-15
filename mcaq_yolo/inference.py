@@ -14,11 +14,23 @@ from typing import List, Dict, Optional, Tuple
 import warnings
 warnings.filterwarnings('ignore')
 
-from models.mcaq_yolo import MCAQYOLO
-from utils.visualization import (
-    visualize_complexity_map,
-    visualize_bit_allocation
-)
+try:  # ultralytics >= 8.4 moved NMS out of ops
+    from ultralytics.utils.nms import non_max_suppression
+except ImportError:  # ultralytics 8.0-8.3
+    from ultralytics.utils.ops import non_max_suppression
+
+try:  # package context: python -m mcaq_yolo.inference / from mcaq_yolo.inference import Predictor
+    from .models.mcaq_yolo import MCAQYOLO
+    from .utils.visualization import (
+        visualize_complexity_map,
+        visualize_bit_allocation,
+    )
+except ImportError:  # legacy: executed as a bare script inside mcaq_yolo/
+    from models.mcaq_yolo import MCAQYOLO
+    from utils.visualization import (
+        visualize_complexity_map,
+        visualize_bit_allocation,
+    )
 
 
 class Predictor:
@@ -81,32 +93,47 @@ class Predictor:
             min_bits=config.get('quantization', {}).get('min_bits', 2),
             max_bits=config.get('quantization', {}).get('max_bits', 8),
             target_bits=config.get('quantization', {}).get('target_bits', 4),
+            grid_size=config.get('quantization', {}).get('grid_size', 8),
+            bit_mapping=config.get('quantization', {}).get('bit_mapping', 'mlp'),
             device=str(self.device)
         )
         
-        # Load weights
-        if 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
-        else:
-            model.load_state_dict(checkpoint)
-        
+        # Load weights — strict first (integrity), fall back to strict=False
+        # for checkpoints from older code revisions (parameter names changed
+        # across the paper-alignment refactor), with an explicit warning.
+        state = checkpoint.get('model_state_dict', checkpoint)
+        try:
+            model.load_state_dict(state)
+        except RuntimeError as e:
+            print(f"[MCAQ][WARN] strict load failed ({str(e)[:200]}...)\n"
+                  f"[MCAQ][WARN] retrying with strict=False — verify the "
+                  f"checkpoint matches this code revision!")
+            incompat = model.load_state_dict(state, strict=False)
+            if incompat.missing_keys:
+                print(f"[MCAQ][WARN] missing keys: {len(incompat.missing_keys)}")
+            if incompat.unexpected_keys:
+                print(f"[MCAQ][WARN] unexpected keys: {len(incompat.unexpected_keys)}")
+
         return model.to(self.device)
     
     def _load_class_names(self, config_path: Optional[str]) -> List[str]:
-        """Load class names from configuration."""
+        """Load class names: config file > model's embedded names > empty."""
         if config_path and Path(config_path).exists():
             import yaml
             with open(config_path, 'r') as f:
                 config = yaml.safe_load(f)
-                return config.get('class_names', [])
-        
-        # Default COCO classes (subset)
-        return [
-            'person', 'bicycle', 'car', 'motorcycle', 'airplane',
-            'bus', 'train', 'truck', 'boat', 'traffic light',
-            'fire hydrant', 'stop sign', 'parking meter', 'bench',
-            'bird', 'cat', 'dog', 'horse', 'sheep', 'cow'
-        ]
+                names = config.get('class_names', [])
+                if names:
+                    return names
+
+        # Fall back to the names embedded in the underlying YOLO model
+        # (full COCO-80 for pretrained yolov8 weights)
+        embedded = getattr(getattr(self.model, 'model', None), 'names', None)
+        if isinstance(embedded, dict) and embedded:
+            return [embedded[i] for i in sorted(embedded)]
+        if isinstance(embedded, (list, tuple)) and embedded:
+            return list(embedded)
+        return []
     
     def _warmup(self):
         """Warmup model for consistent inference time."""
@@ -146,127 +173,74 @@ class Predictor:
         
         return tensor, (scale, pad_w, pad_h)
     
+    @staticmethod
+    def _extract_prediction_tensor(predictions):
+        """
+        Pull the concatenated eval-mode prediction tensor (B, 4+nc, N) out of
+        the raw model output. Ultralytics DetectionModel in eval returns
+        (y_cat, raw_feature_list); training mode returns the raw list directly
+        (not decodable here).
+        """
+        if torch.is_tensor(predictions):
+            return predictions
+        if isinstance(predictions, (list, tuple)) and len(predictions) > 0:
+            if torch.is_tensor(predictions[0]):
+                return predictions[0]
+        raise TypeError(
+            "Cannot extract decodable predictions — run the model in eval mode "
+            f"(got {type(predictions)})"
+        )
+
     def postprocess(
         self,
-        predictions: torch.Tensor,
+        predictions,
         scale_info: Tuple[float, int, int],
         original_shape: Tuple[int, int]
     ) -> List[Dict]:
         """
-        Postprocess model predictions.
-        
+        Postprocess model predictions: official Ultralytics NMS (which decodes
+        the (B, 4+nc, N) head output to xyxy+conf+cls), then map boxes from the
+        letterboxed 640-space back to the original image.
+
         Args:
-            predictions: Raw model outputs
+            predictions: Raw model outputs (eval mode)
             scale_info: Scaling information (scale, pad_w, pad_h)
             original_shape: Original image shape (H, W)
-            
+
         Returns:
             List of detections
         """
-        # Apply NMS
-        detections = self._apply_nms(predictions)
-        
+        preds = self._extract_prediction_tensor(predictions)
+        detections = non_max_suppression(
+            preds,
+            conf_thres=self.conf_threshold,
+            iou_thres=self.iou_threshold,
+            max_det=self.max_det,
+        )  # list per image of (n, 6) [x1, y1, x2, y2, conf, cls]
+
         # Scale back to original coordinates
         scale, pad_w, pad_h = scale_info
         h_orig, w_orig = original_shape
-        
+
         results = []
         for det in detections:
             if len(det) > 0:
-                # Scale coordinates
-                det[:, 0] = (det[:, 0] - pad_w) / scale
-                det[:, 2] = (det[:, 2] - pad_w) / scale
-                det[:, 1] = (det[:, 1] - pad_h) / scale
-                det[:, 3] = (det[:, 3] - pad_h) / scale
-                
-                # Clip to image bounds
-                det[:, 0] = det[:, 0].clamp(0, w_orig)
-                det[:, 2] = det[:, 2].clamp(0, w_orig)
-                det[:, 1] = det[:, 1].clamp(0, h_orig)
-                det[:, 3] = det[:, 3].clamp(0, h_orig)
-                
+                # Undo letterbox: subtract padding, divide by scale
+                det[:, 0] = ((det[:, 0] - pad_w) / scale).clamp(0, w_orig)
+                det[:, 2] = ((det[:, 2] - pad_w) / scale).clamp(0, w_orig)
+                det[:, 1] = ((det[:, 1] - pad_h) / scale).clamp(0, h_orig)
+                det[:, 3] = ((det[:, 3] - pad_h) / scale).clamp(0, h_orig)
+
                 for d in det:
+                    cls_id = int(d[5].item())
                     results.append({
                         'bbox': d[:4].cpu().numpy().tolist(),
                         'confidence': d[4].cpu().item(),
-                        'class_id': int(d[5].cpu().item()),
-                        'class_name': self.class_names[int(d[5])] if int(d[5]) < len(self.class_names) else 'unknown'
+                        'class_id': cls_id,
+                        'class_name': self.class_names[cls_id] if cls_id < len(self.class_names) else 'unknown'
                     })
-        
+
         return results
-    
-    def _apply_nms(self, predictions: torch.Tensor) -> List[torch.Tensor]:
-        """Apply Non-Maximum Suppression."""
-        # Simplified NMS implementation
-        # In practice, would use torchvision.ops.nms
-        
-        output = []
-        for pred in predictions:
-            # Filter by confidence
-            mask = pred[:, 4] > self.conf_threshold
-            pred = pred[mask]
-            
-            if len(pred) == 0:
-                output.append(torch.empty(0, 6))
-                continue
-            
-            # Get boxes, scores, and classes
-            boxes = pred[:, :4]
-            scores = pred[:, 4]
-            classes = pred[:, 5]
-            
-            # Simple NMS per class
-            keep = []
-            for cls_id in torch.unique(classes):
-                cls_mask = classes == cls_id
-                cls_boxes = boxes[cls_mask]
-                cls_scores = scores[cls_mask]
-                
-                # Sort by score
-                order = cls_scores.argsort(descending=True)
-                cls_boxes = cls_boxes[order]
-                cls_scores = cls_scores[order]
-                
-                # Apply NMS
-                keep_cls = []
-                while len(cls_boxes) > 0:
-                    keep_cls.append(order[0])
-                    
-                    if len(cls_boxes) == 1:
-                        break
-                    
-                    # Compute IoU
-                    ious = self._compute_iou(cls_boxes[0:1], cls_boxes[1:])
-                    
-                    # Keep boxes with low IoU
-                    mask = ious < self.iou_threshold
-                    cls_boxes = cls_boxes[1:][mask]
-                    order = order[1:][mask]
-                
-                keep.extend([i for i in range(len(pred)) if cls_mask[i] and i in keep_cls])
-            
-            # Limit detections
-            keep = keep[:self.max_det]
-            output.append(pred[keep])
-        
-        return output
-    
-    def _compute_iou(self, box1: torch.Tensor, box2: torch.Tensor) -> torch.Tensor:
-        """Compute IoU between boxes."""
-        # Get intersection
-        inter_x1 = torch.max(box1[:, 0], box2[:, 0])
-        inter_y1 = torch.max(box1[:, 1], box2[:, 1])
-        inter_x2 = torch.min(box1[:, 2], box2[:, 2])
-        inter_y2 = torch.min(box1[:, 3], box2[:, 3])
-        
-        inter_area = (inter_x2 - inter_x1).clamp(0) * (inter_y2 - inter_y1).clamp(0)
-        
-        # Get union
-        box1_area = (box1[:, 2] - box1[:, 0]) * (box1[:, 3] - box1[:, 1])
-        box2_area = (box2[:, 2] - box2[:, 0]) * (box2[:, 3] - box2[:, 1])
-        union_area = box1_area + box2_area - inter_area
-        
-        return inter_area / (union_area + 1e-7)
     
     def predict(
         self,
@@ -295,18 +269,28 @@ class Predictor:
             outputs, aux_info = self.model(tensor, temperature=1.0, return_aux=True)
         
         inference_time = (time.time() - start_time) * 1000  # ms
-        
+
         # Postprocess
         detections = self.postprocess(outputs, scale_info, image.shape[:2])
-        
+
+        # aux maps are per-scale lists (backbone C3/C4/C5 quantization);
+        # use the highest-resolution scale (P3) for reporting/visualization
+        def _first_map(m):
+            if isinstance(m, (list, tuple)):
+                m = m[0] if m else torch.zeros(1, 8, 8)
+            return m
+
+        cmap = _first_map(aux_info['complexity_map'])
+        bmap = _first_map(aux_info['bit_map'])
+
         # Prepare results
         results = {
             'detections': detections,
             'num_detections': len(detections),
             'inference_time_ms': inference_time,
             'avg_bits': aux_info['avg_bits'].item(),
-            'complexity_map': aux_info['complexity_map'].cpu().numpy(),
-            'bit_map': aux_info['bit_map'].cpu().numpy()
+            'complexity_map': cmap.detach().cpu().numpy(),
+            'bit_map': bmap.detach().cpu().numpy()
         }
         
         # Visualize if requested
@@ -314,16 +298,16 @@ class Predictor:
             vis_image = self.visualize_predictions(image, detections)
             results['visualization'] = vis_image
             
-            # Visualize complexity and bit allocation
+            # Visualize complexity and bit allocation (P3 scale)
             complexity_fig = visualize_complexity_map(
                 image,
-                aux_info['complexity_map'].squeeze(),
+                results['complexity_map'].squeeze(),
                 save_path=save_path.replace('.jpg', '_complexity.jpg') if save_path else None
             )
-            
+
             bit_fig = visualize_bit_allocation(
                 image,
-                aux_info['bit_map'].squeeze(),
+                results['bit_map'].squeeze(),
                 save_path=save_path.replace('.jpg', '_bits.jpg') if save_path else None
             )
             
@@ -427,22 +411,45 @@ class Predictor:
             
             # Stack tensors
             batch_tensor = torch.cat(tensors, dim=0)
-            
+
             # Inference
             with torch.no_grad():
                 outputs, aux_info = self.model(batch_tensor, temperature=1.0, return_aux=True)
-            
-            # Postprocess each image
+
+            # Decode + NMS once for the whole batch, then rescale per image
+            preds = self._extract_prediction_tensor(outputs)
+            batch_dets = non_max_suppression(
+                preds,
+                conf_thres=self.conf_threshold,
+                iou_thres=self.iou_threshold,
+                max_det=self.max_det,
+            )
+
+            avg_bits = aux_info['avg_bits'].item()  # spatial average (scalar)
+
             for j, (img, scale_info) in enumerate(zip(batch_images, scale_infos)):
-                detections = self.postprocess(
-                    outputs[j:j+1],
-                    scale_info,
-                    img.shape[:2]
-                )
-                
+                det = batch_dets[j]
+                scale, pad_w, pad_h = scale_info
+                h_orig, w_orig = img.shape[:2]
+
+                detections = []
+                if len(det) > 0:
+                    det[:, 0] = ((det[:, 0] - pad_w) / scale).clamp(0, w_orig)
+                    det[:, 2] = ((det[:, 2] - pad_w) / scale).clamp(0, w_orig)
+                    det[:, 1] = ((det[:, 1] - pad_h) / scale).clamp(0, h_orig)
+                    det[:, 3] = ((det[:, 3] - pad_h) / scale).clamp(0, h_orig)
+                    for d in det:
+                        cls_id = int(d[5].item())
+                        detections.append({
+                            'bbox': d[:4].cpu().numpy().tolist(),
+                            'confidence': d[4].cpu().item(),
+                            'class_id': cls_id,
+                            'class_name': self.class_names[cls_id] if cls_id < len(self.class_names) else 'unknown'
+                        })
+
                 results.append({
                     'detections': detections,
-                    'avg_bits': aux_info['avg_bits'][j].item() if aux_info['avg_bits'].dim() > 0 else aux_info['avg_bits'].item()
+                    'avg_bits': avg_bits
                 })
         
         return results

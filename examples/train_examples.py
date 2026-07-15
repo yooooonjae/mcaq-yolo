@@ -7,7 +7,7 @@ import sys
 sys.path.append('..')
 
 from mcaq_yolo.models.mcaq_yolo import MCAQYOLO
-from mcaq_yolo.train import Trainer, load_config
+from mcaq_yolo.train import Trainer
 import torch
 
 
@@ -21,8 +21,9 @@ def main():
             'num_classes': 80
         },
         'data': {
-            'train_path': 'path/to/train',
-            'val_path': 'path/to/val',
+            'yaml_path': 'path/to/dataset.yaml',  # YOLOv8 dataset yaml (path/train/val/names)
+            'train': 'images/train',
+            'val': 'images/val',
             'img_size': 640,
             'num_workers': 4
         },

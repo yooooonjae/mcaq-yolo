@@ -21,20 +21,25 @@ class CurriculumScheduler:
     
     def __init__(
         self,
-        warmup_epochs: int = 10,
-        total_epochs: int = 300,
-        initial_complexity: float = 0.2,
-        initial_temperature: float = 10.0,
+        warmup_epochs: int = 20,   # Paper Table X: Twarm = 20 (Stage 1 boundary)
+        transition_epochs: int = 50,  # Paper Fig.3: Stage 2 ends at epoch 50
+        total_epochs: int = 300,   # Paper Table X: total epochs = 300
+        initial_complexity: float = 0.2,   # Paper: tau0 = 0.2
+        initial_temperature: float = 10.0,  # Paper: initial temperature 10.0
         initial_bits: float = 8.0,
         target_bits: float = 4.0,
-        curriculum_type: str = 'exponential'  # 'linear', 'exponential', 'cosine', 'step'
+        curriculum_type: str = 'exponential',  # 'linear', 'exponential', 'cosine', 'step'
+        lambda_smooth: float = 0.1  # Table X lambda2; scale down for finer grids
+                                    # (Lsmooth sums |db| over tile pairs — a 20x20
+                                    # grid has ~7x the terms of the paper's 8x8)
     ):
         """
         Initialize curriculum scheduler.
-        
+
         Args:
-            warmup_epochs: Number of warmup epochs
-            total_epochs: Total training epochs
+            warmup_epochs: Number of warmup epochs (Stage 1: epochs 0-Twarm)
+            transition_epochs: End of Stage 2 (transition; paper: epochs 20-50)
+            total_epochs: Total training epochs (Stage 3 runs to the end)
             initial_complexity: Starting complexity threshold
             initial_temperature: Starting temperature
             initial_bits: Starting bit-width
@@ -42,12 +47,14 @@ class CurriculumScheduler:
             curriculum_type: Type of curriculum progression
         """
         self.warmup_epochs = warmup_epochs
+        self.transition_epochs = transition_epochs
         self.total_epochs = total_epochs
         self.initial_complexity = initial_complexity
         self.initial_temperature = initial_temperature
         self.initial_bits = initial_bits
         self.target_bits = target_bits
         self.curriculum_type = curriculum_type
+        self.lambda_smooth = lambda_smooth
         
         # Track current state
         self.current_epoch = 0
@@ -55,6 +62,25 @@ class CurriculumScheduler:
         self.temperature_history = []
         self.bits_history = []
         
+    def get_stage(self, epoch: int) -> int:
+        """
+        Three-stage curriculum schedule (paper Fig.3 / Sec IV-C):
+
+          Stage 1 (epochs 0-Twarm):  warm-up — low-complexity samples only,
+                                     high precision (FP16; quantization bypassed)
+          Stage 2 (Twarm-transition): transition — mixed-complexity samples,
+                                     dynamic bit allocation, temperature annealing
+          Stage 3 (transition-end):  full MCAQ — all samples, aggressive quantization
+
+        Returns:
+            Stage number in {1, 2, 3}
+        """
+        if epoch <= self.warmup_epochs:
+            return 1
+        elif epoch <= self.transition_epochs:
+            return 2
+        return 3
+
     def get_complexity_threshold(self, epoch: int) -> float:
         """
         Get complexity threshold for current epoch.
@@ -65,6 +91,12 @@ class CurriculumScheduler:
         Returns:
             Complexity threshold in [0, 1]
         """
+        # Paper Algorithm 3 line 5: tau_t = tau0 + (1 - tau0) * t / Twarm for
+        # t <= Twarm, then 1.0. NOTE: Fig.3's caption ("Stage 1 uses only
+        # low-complexity samples") is the schematic description of early warm-up;
+        # the precise spec — Sec IV-C: "the complexity threshold tau_t increases
+        # linearly from tau0=0.2 to 1.0 during the warmup phase" — matches
+        # Algorithm 3 and is what is implemented here.
         if epoch <= self.warmup_epochs:
             # Linear increase during warmup
             progress = epoch / self.warmup_epochs
@@ -92,9 +124,13 @@ class CurriculumScheduler:
             temperature = self.initial_temperature * (1.0 - progress) + 1.0 * progress
             
         elif self.curriculum_type == 'exponential':
-            # Exponential decay
-            decay_rate = 5000
-            temperature = 1.0 + (self.initial_temperature - 1.0) * np.exp(-epoch / decay_rate)
+            # Paper Algorithm 3 (line 10) / Sec IV-C: alpha_t = 1 + 9 * exp(-5t/T)
+            # initial_temperature controls the "+9" coefficient via (init - 1);
+            # with init=10 and T=total_epochs this is exactly 1 + 9*exp(-5t/T).
+            t = min(epoch, self.total_epochs)
+            temperature = 1.0 + (self.initial_temperature - 1.0) * np.exp(
+                -5.0 * t / max(1, self.total_epochs)
+            )
             
         elif self.curriculum_type == 'cosine':
             # Cosine annealing
@@ -171,26 +207,29 @@ class CurriculumScheduler:
         Returns:
             Dictionary of loss weights
         """
-        # Gradually increase quantization loss importance
-        if epoch < self.warmup_epochs:
-            # Focus on detection during warmup
-            weights = {
-                'detection': 1.0,
-                'bit_budget': 0.001,
-                'smoothness': 0.0001,
-                'distillation': 0.1,
-                'regularization': 0.0001
-            }
-        else:
-            progress = (epoch - self.warmup_epochs) / (self.total_epochs - self.warmup_epochs)
-            weights = {
-                'detection': 1.0,
-                'bit_budget': 0.001 + 0.009 * progress,  # Increase to 0.01
-                'smoothness': 0.0001 + 0.0009 * progress,  # Increase to 0.001
-                'distillation': 0.1 + 0.4 * progress,  # Increase to 0.5
-                'regularization': 0.0001
-            }
-        
+        # Paper Eq.(20) + Table X loss weights:
+        #   lambda1 (bit budget): annealed 0.01 -> 0.1 during training
+        #   lambda2 (smoothness): 0.1   (constant)
+        #   lambda3 (KD):         0.5   (constant)
+        #   lambda4 (reg):        1e-4  (constant)
+        progress = min(epoch / max(1, self.total_epochs), 1.0)
+        lambda1 = 0.01 + (0.1 - 0.01) * progress  # annealed bit-budget weight
+
+        # Smoothness ramp (Codex review #4): zero during the high-precision
+        # warm-up (no quantization -> nothing to smooth) and ramped across the
+        # transition stage, so the flat-map reward cannot dominate before
+        # Ldet's tile-wise signal exists.
+        span = max(1, self.transition_epochs - self.warmup_epochs)
+        ramp = min(1.0, max(0.0, (epoch - self.warmup_epochs) / span))
+
+        weights = {
+            'detection': 1.0,
+            'bit_budget': lambda1,
+            'smoothness': self.lambda_smooth * ramp,
+            'distillation': 0.5,
+            'regularization': 1e-4,
+        }
+
         return weights
 
 

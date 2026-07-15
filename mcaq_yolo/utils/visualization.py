@@ -5,7 +5,6 @@ Visualization utilities for MCAQ-YOLO
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-import seaborn as sns
 from typing import Optional, List, Dict, Tuple
 import cv2
 from pathlib import Path

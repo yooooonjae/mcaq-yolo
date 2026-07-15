@@ -153,11 +153,87 @@ class LearnedRoundingQuantization(nn.Module):
         return x_floor + alpha * (x_ceil - x_floor)
 
 
+class LearnedSoftMask(nn.Module):
+    """
+    Paper Eq.(19) m(p): "a learned soft mask that varies smoothly over space ...
+    produced by a softmax-based module followed by spatial smoothing".
+
+    The paper does not specify the module's architecture, so this is a minimal
+    literal realization (documented implementation choice):
+      - input: per-tile statistics (allocated bits, mean activation magnitude)
+        — channel-agnostic so one module serves any feature width
+      - a small conv head produces 2 logits; a channel-wise softmax bounds
+        m to [0,1] (the "softmax-based" part)
+      - nearest upsampling keeps the single-tile assignment per position;
+        Gaussian spatial smoothing then makes m(p) change gradually across
+        tile boundaries (the "spatial smoothing" part)
+      - initialized so m(p) ~= 0.98 (near-identity) at the start of training
+    """
+
+    def __init__(self, hidden: int = 8, kernel_size: int = 5):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(2, hidden, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden, 2, 1),
+        )
+        # Near-identity init: the last layer uses NEAR-zero (std=1e-3, not
+        # exactly zero) weights so the bias logit gap of 4 dominates
+        # (softmax ~= 0.982 ~ identity) while the gradient path through
+        # W2^T @ grad stays alive from the very first backward pass — an
+        # exactly-zero W2 would give net[0] a zero gradient on step 1
+        # (final verification finding). The first conv keeps its default init.
+        nn.init.normal_(self.net[-1].weight, std=1e-3)
+        with torch.no_grad():
+            self.net[-1].bias.copy_(torch.tensor([4.0, 0.0]))
+
+        # Gaussian smoothing kernel for the spatial-smoothing step
+        k = kernel_size
+        sigma = k / 3.0
+        x = torch.arange(k, dtype=torch.float32) - k // 2
+        g1 = torch.exp(-x ** 2 / (2 * sigma ** 2))
+        g1 = g1 / g1.sum()
+        g2 = (g1.unsqueeze(0) * g1.unsqueeze(1)).unsqueeze(0).unsqueeze(0)
+        self.register_buffer('smooth_kernel', g2)
+        self.kernel_size = k
+
+    def forward(
+        self,
+        bit_map: torch.Tensor,   # (B, Ht, Wt) — continuous during training
+        x: torch.Tensor,         # (B, C, H, W) — activations being quantized
+    ) -> torch.Tensor:
+        """Returns m(p) of shape (B, 1, H, W) in [0, 1]."""
+        B, C, H, W = x.shape
+        Ht, Wt = bit_map.shape[-2:]
+
+        # Per-tile mean activation magnitude (side information, no grad to x)
+        with torch.no_grad():
+            act = F.adaptive_avg_pool2d(x.detach().abs().mean(1, keepdim=True), (Ht, Wt))
+            act = act / (act.amax(dim=(2, 3), keepdim=True) + 1e-8)
+
+        bits_norm = ((bit_map.unsqueeze(1).float() - 2.0) / 6.0).clamp(0.0, 1.0)
+        feats = torch.cat([bits_norm, act.float()], dim=1)  # (B,2,Ht,Wt)
+
+        logits = self.net(feats)
+        m = torch.softmax(logits, dim=1)[:, :1]  # softmax-based bounding to [0,1]
+
+        # Single-tile assignment per position, then spatial smoothing.
+        # Replicate padding: implicit zero padding would decay the mask at
+        # image borders (a constant m would not survive the border rows).
+        m = F.interpolate(m, size=(H, W), mode='nearest')
+        p = self.kernel_size // 2
+        m = F.conv2d(F.pad(m, (p, p, p, p), mode='replicate'), self.smooth_kernel)
+        return m
+
+
 class SpatialAdaptiveQuantization(nn.Module):
     """
     Hardware-aware spatial adaptive quantization module.
-    
-    Implements tile-wise mixed-precision quantization with smooth transitions.
+
+    Implements tile-wise mixed-precision quantization (Eq.19):
+        X_q(p) = m(p) * Q_{bT(p)}(X(p))
+    with a single-tile assignment per spatial position and a learned,
+    spatially-smoothed soft mask m(p).
     """
     
     def __init__(
@@ -166,17 +242,18 @@ class SpatialAdaptiveQuantization(nn.Module):
         smooth_transitions: bool = True,
         per_channel: bool = True,
         learned_rounding: bool = False,
-        momentum: float = 0.1
+        momentum: float = 0.99
     ):
         """
         Initialize spatial adaptive quantization.
-        
+
         Args:
             calibration_mode: Method for computing quantization parameters
             smooth_transitions: Whether to use smooth transitions between tiles
             per_channel: Whether to quantize per-channel or per-tensor
             learned_rounding: Whether to use learned rounding
-            momentum: Momentum for running statistics
+            momentum: EMA decay for running statistics (paper Table X: EMA momentum
+                      0.99, i.e. running <- 0.99*running + 0.01*new)
         """
         super().__init__()
         self.calibration_mode = calibration_mode
@@ -188,47 +265,53 @@ class SpatialAdaptiveQuantization(nn.Module):
         self.register_buffer('running_min', None)
         self.register_buffer('running_max', None)
         self.register_buffer('num_batches_tracked', torch.tensor(0))
+        # Paper Sec IV-D: stats are collected over 1,000 calibration images with
+        # EMA(0.99), "then frozen to compute scale and zero-point per channel".
+        self.register_buffer('stats_frozen', torch.tensor(False))
         
         # Learned rounding module
         self.learned_rounding = None
         if learned_rounding:
             self.learned_rounding = LearnedRoundingQuantization()
         
-        # Smooth transition parameters
-        if smooth_transitions:
-            self.transition_kernel_size = 3
-            self.register_buffer(
-                'transition_kernel',
-                self._create_transition_kernel()
-            )
+        # Eq.(19) learned soft mask m(p): softmax-based module + spatial smoothing
+        self.soft_mask = LearnedSoftMask() if smooth_transitions else None
         
         # Calibration statistics
         self.register_buffer('calibration_histogram', None)
         self.histogram_bins = 2048
     
-    def _create_transition_kernel(self) -> torch.Tensor:
-        """Create Gaussian kernel for smooth transitions between tiles."""
-        k = self.transition_kernel_size
-        sigma = k / 3.0
-        
-        # Create 1D Gaussian
-        x = torch.arange(k, dtype=torch.float32) - k // 2
-        kernel_1d = torch.exp(-x ** 2 / (2 * sigma ** 2))
-        kernel_1d = kernel_1d / kernel_1d.sum()
-        
-        # Create 2D Gaussian kernel
-        kernel_2d = kernel_1d.unsqueeze(0) * kernel_1d.unsqueeze(1)
-        kernel_2d = kernel_2d.unsqueeze(0).unsqueeze(0)
-        
-        return kernel_2d
-    
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        """
+        Materialize lazily-created (None) stat buffers before loading so
+        checkpointed EMA calibration statistics can be restored. Buffers
+        registered as None are absent from a fresh module's state_dict, so a
+        trained checkpoint's running_min/max would otherwise fail strict
+        loading and be silently dropped under strict=False (observed when
+        loading outputs/coco128_run30/best.pt).
+        """
+        for name in ('running_min', 'running_max'):
+            key = prefix + name
+            if key in state_dict and getattr(self, name) is None:
+                setattr(self, name, torch.zeros_like(state_dict[key]))
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                                      missing_keys, unexpected_keys, error_msgs)
+
+    def freeze_calibration(self):
+        """Freeze calibration statistics (paper Sec IV-D: EMA over 1,000
+        calibration images, then frozen for scale/zero-point computation)."""
+        self.stats_frozen = torch.tensor(True, device=self.stats_frozen.device)
+
     def update_running_stats(self, x: torch.Tensor):
         """
         Update running statistics for calibration.
-        
+
         Args:
             x: Input tensor
         """
+        if bool(self.stats_frozen):
+            return  # calibration frozen — stats fixed (paper Sec IV-D)
         with torch.no_grad():
             # Compute min/max
             if self.per_channel:
@@ -241,13 +324,14 @@ class SpatialAdaptiveQuantization(nn.Module):
                 x_min = x.min()
                 x_max = x.max()
             
-            # Update running statistics
+            # Update running statistics — EMA with decay = momentum (paper: 0.99):
+            # running <- momentum * running + (1 - momentum) * new
             if self.running_min is None:
                 self.running_min = x_min
                 self.running_max = x_max
             else:
-                self.running_min = (1 - self.momentum) * self.running_min + self.momentum * x_min
-                self.running_max = (1 - self.momentum) * self.running_max + self.momentum * x_max
+                self.running_min = self.momentum * self.running_min + (1 - self.momentum) * x_min
+                self.running_max = self.momentum * self.running_max + (1 - self.momentum) * x_max
             
             self.num_batches_tracked += 1
             
@@ -270,10 +354,10 @@ class SpatialAdaptiveQuantization(nn.Module):
             if self.calibration_histogram is None:
                 self.calibration_histogram = hist
             else:
-                # Exponential moving average
+                # Exponential moving average (decay = momentum)
                 self.calibration_histogram = (
-                    (1 - self.momentum) * self.calibration_histogram +
-                    self.momentum * hist
+                    self.momentum * self.calibration_histogram +
+                    (1 - self.momentum) * hist
                 )
     
     def get_calibration_params(
@@ -310,7 +394,11 @@ class SpatialAdaptiveQuantization(nn.Module):
         bits: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Min-max calibration."""
-        if self.training and self.running_min is not None:
+        use_running = self.running_min is not None and (
+            self.training or bool(self.stats_frozen)
+        )
+        if use_running:
+            # Frozen (post-calibration) or training-time EMA statistics
             x_min = self.running_min
             x_max = self.running_max
         else:
@@ -335,22 +423,42 @@ class SpatialAdaptiveQuantization(nn.Module):
         percentile_max: float = 99.99
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Percentile-based calibration for outlier robustness."""
+        # 큰 텐서에서 quantile 계산 시 메모리 문제 방지를 위해 샘플링 사용
+        max_samples = 100000  # 최대 샘플 수
+
         if self.per_channel:
             # Reshape for per-channel percentile
-            x_reshaped = x.transpose(0, 1).flatten(1)
-            x_min = torch.quantile(x_reshaped, percentile_min / 100, dim=1, keepdim=True)
-            x_max = torch.quantile(x_reshaped, percentile_max / 100, dim=1, keepdim=True)
-            
+            x_reshaped = x.transpose(0, 1).flatten(1)  # (C, N)
+            C, N = x_reshaped.shape
+
+            if N > max_samples:
+                # 랜덤 샘플링
+                indices = torch.randperm(N, device=x.device)[:max_samples]
+                x_sampled = x_reshaped[:, indices]
+            else:
+                x_sampled = x_reshaped
+
+            # 샘플링된 데이터로 percentile 계산
+            x_min = torch.quantile(x_sampled, percentile_min / 100, dim=1, keepdim=True)
+            x_max = torch.quantile(x_sampled, percentile_max / 100, dim=1, keepdim=True)
+
             # Reshape back
             x_min = x_min.view(1, -1, 1, 1)
             x_max = x_max.view(1, -1, 1, 1)
         else:
-            x_min = torch.quantile(x, percentile_min / 100)
-            x_max = torch.quantile(x, percentile_max / 100)
-        
+            x_flat = x.flatten()
+            if x_flat.numel() > max_samples:
+                indices = torch.randperm(x_flat.numel(), device=x.device)[:max_samples]
+                x_sampled = x_flat[indices]
+            else:
+                x_sampled = x_flat
+
+            x_min = torch.quantile(x_sampled, percentile_min / 100)
+            x_max = torch.quantile(x_sampled, percentile_max / 100)
+
         qparams = QuantizationParameters(bits)
         scale, zero_point = qparams.compute_scale_zeropoint(x_min, x_max)
-        
+
         return scale, zero_point
     
     def _calibrate_entropy(
@@ -425,64 +533,6 @@ class SpatialAdaptiveQuantization(nn.Module):
                 best_zero_point = zero_point
         
         return best_scale, best_zero_point
-    
-    def create_tile_masks(
-        self,
-        shape: Tuple[int, ...],
-        tile_shape: Tuple[int, int],
-        bit_map: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Create smooth transition masks for tiles.
-        
-        Args:
-            shape: Shape of input tensor (B, C, H, W)
-            tile_shape: Shape of each tile (tile_h, tile_w)
-            bit_map: Bit allocation map
-            
-        Returns:
-            Masks for smooth transitions between tiles
-        """
-        B, C, H, W = shape
-        tile_h, tile_w = tile_shape
-        B_b, h_tiles, w_tiles = bit_map.shape
-        
-        # Create base masks
-        masks = torch.zeros(B, h_tiles * w_tiles, H, W, device=bit_map.device)
-        
-        for b in range(B):
-            mask_idx = 0
-            for i in range(h_tiles):
-                for j in range(w_tiles):
-                    # Create binary mask for this tile
-                    mask = torch.zeros(H, W, device=bit_map.device)
-                    
-                    # Set tile region to 1
-                    h_start = i * tile_h
-                    h_end = min((i + 1) * tile_h, H)
-                    w_start = j * tile_w
-                    w_end = min((j + 1) * tile_w, W)
-                    
-                    mask[h_start:h_end, w_start:w_end] = 1.0
-                    
-                    if self.smooth_transitions and self.transition_kernel is not None:
-                        # Apply Gaussian smoothing for smooth transitions
-                        mask = mask.unsqueeze(0).unsqueeze(0)
-                        mask = F.conv2d(
-                            mask,
-                            self.transition_kernel.to(mask.device),
-                            padding=self.transition_kernel_size // 2
-                        )
-                        mask = mask.squeeze()
-                    
-                    masks[b, mask_idx] = mask
-                    mask_idx += 1
-        
-        # Normalize masks so they sum to 1 at each position
-        mask_sum = masks.sum(dim=1, keepdim=True)
-        masks = masks / (mask_sum + 1e-8)
-        
-        return masks
     
     def quantize_tensor(
         self,
@@ -567,9 +617,13 @@ class SpatialAdaptiveQuantization(nn.Module):
         tile_h = H // H_tiles
         tile_w = W // W_tiles
         
-        # Calculate min/max stats on the fly (Dynamic Quantization for Inference)
-        # Or you could use self.running_min/max if you prefer static quantization
-        if self.per_channel:
+        # Paper Sec IV-D: after calibration the EMA statistics are frozen and
+        # reused at inference; dynamic per-batch min/max is the fallback when
+        # no calibration has been performed.
+        if bool(self.stats_frozen) and self.running_min is not None:
+            x_min = self.running_min.view(1, -1, 1, 1)
+            x_max = self.running_max.view(1, -1, 1, 1)
+        elif self.per_channel:
              # Calculate per-channel min/max over (Batch, Height, Width) for consistent scaling per channel
              # Note: Kernel expects (1, C, 1, 1) layout
              x_min = x.amin(dim=(0, 2, 3), keepdim=True)
@@ -579,7 +633,7 @@ class SpatialAdaptiveQuantization(nn.Module):
              x_max = x.max().view(1, 1, 1, 1)
 
         # Ensure contiguous memory for CUDA
-        return mcaq_cuda_ops.spatial_quantize(
+        out = mcaq_cuda_ops.spatial_quantize(
             x.contiguous(),
             bit_map.float().contiguous(),
             x_min.contiguous(),
@@ -587,70 +641,80 @@ class SpatialAdaptiveQuantization(nn.Module):
             tile_h, tile_w
         )
 
+        # Eq.(19): apply the learned soft mask m(p) (the fused kernel in the
+        # paper's Listing 2 folds this multiply into the kernel; here it is an
+        # equivalent elementwise post-multiply)
+        if self.smooth_transitions and self.soft_mask is not None:
+            m = self.soft_mask(bit_map, x)
+            out = out * m
+
+        return out
+
     def _forward_pytorch(self, x: torch.Tensor, bit_map: torch.Tensor, training: bool) -> torch.Tensor:
         """Original PyTorch forward pass (slow, but differentiable)."""
         B, C, H, W = x.shape
         B_b, H_tiles, W_tiles = bit_map.shape
-        
+
         assert B == B_b, f"Batch size mismatch: {B} vs {B_b}"
-        
+
         tile_h = H // H_tiles
         tile_w = W // W_tiles
-        
+
         # Get unique bit widths in the map
         unique_bits = torch.unique(bit_map)
-        
-        if self.smooth_transitions:
-            # Use smooth transitions between different bit widths
+
+        # NOTE (paper fidelity): smooth transitions come from spatially smoothing
+        # the learned mask m(p) — "rather than by summing contributions from
+        # multiple tiles" (Sec IV-D). The previous Gaussian-mask-summing branch
+        # contradicted that sentence and was removed; every spatial position is
+        # quantized with exactly one tile's bit-width, then scaled by m(p).
+        if training:
+            # Paper Eq.(19): tile-wise mixed precision must be maintained during
+            # training. Fractional-bit composition keeps the quantized forward
+            # differentiable w.r.t. the (continuous) bit map:
+            #     x_q = (1-frac) * Q_floor(b)(x) + frac * Q_ceil(b)(x),
+            #     frac = b - floor(b)
+            # so d(x_q)/db = Q_ceil(x) - Q_floor(x) and Ldet/LKD gradients reach
+            # the bit-mapping network and complexity MLP through the quantization
+            # operator (paper Training note / Algorithm 3 QuantizedForward).
+            # Integer bit maps (inference-style) reduce to plain per-tile STE.
+            b_floor = torch.floor(bit_map)
+            frac = (bit_map - b_floor).unsqueeze(1)  # (B,1,Ht,Wt), carries grad
+            frac_up = F.interpolate(frac, size=(H, W), mode='nearest')
+
             x_quantized = torch.zeros_like(x)
-            
-            # Create masks for smooth transitions
-            masks = self.create_tile_masks(x.shape, (tile_h, tile_w), bit_map)
-            
-            for bits_value in unique_bits:
-                bits_int = int(bits_value.item())
-                
-                # Quantize entire tensor with this bit width
-                x_quant_bits = self.quantize_tensor(x, bits_int, training)
-                
-                # Create combined mask for all tiles with this bit width
-                combined_mask = torch.zeros(B, 1, H, W, device=x.device)
-                
-                for b in range(B):
-                    mask_idx = 0
-                    for i in range(H_tiles):
-                        for j in range(W_tiles):
-                            if bit_map[b, i, j] == bits_value:
-                                combined_mask[b, 0] += masks[b, mask_idx]
-                            mask_idx += 1
-                
-                # Apply weighted quantization
-                x_quantized += x_quant_bits * combined_mask
-        
+            for bf in torch.unique(b_floor.detach()):
+                bf_int = int(bf.item())
+                bc_int = bf_int + 1
+                sel = (b_floor == bf).float().unsqueeze(1)  # hard tile selection
+                sel_up = F.interpolate(sel, size=(H, W), mode='nearest')
+
+                q_lo = self.quantize_tensor(x, bf_int, training)
+                if bc_int <= 8:
+                    q_hi = self.quantize_tensor(x, bc_int, training)
+                else:
+                    q_hi = q_lo  # b == bmax exactly; frac is 0 there
+                x_quantized = x_quantized + sel_up * (
+                    (1.0 - frac_up) * q_lo + frac_up * q_hi
+                )
+
         else:
-            # Hard boundaries between tiles
+            # Inference: integer per-tile composition via nearest masks
+            # (single-tile assignment per spatial position, Sec IV-D)
             x_quantized = torch.zeros_like(x)
-            
-            for b in range(B):
-                for i in range(H_tiles):
-                    for j in range(W_tiles):
-                        # Get bit width for this tile
-                        tile_bits = int(bit_map[b, i, j].item())
-                        
-                        # Extract tile
-                        h_start = i * tile_h
-                        h_end = min((i + 1) * tile_h, H)
-                        w_start = j * tile_w
-                        w_end = min((j + 1) * tile_w, W)
-                        
-                        tile = x[b:b+1, :, h_start:h_end, w_start:w_end]
-                        
-                        # Quantize tile
-                        tile_quant = self.quantize_tensor(tile, tile_bits, training)
-                        
-                        # Place back
-                        x_quantized[b, :, h_start:h_end, w_start:w_end] = tile_quant[0]
-        
+            for bits_value in unique_bits:
+                bits_int = int(round(float(bits_value.item())))
+                x_q = self.quantize_tensor(x, bits_int, training)
+                tile_mask = (bit_map == bits_value).float().unsqueeze(1)
+                mask = F.interpolate(tile_mask, size=(H, W), mode='nearest')
+                x_quantized = x_quantized + x_q * mask
+
+        # Eq.(19): X_quantized(p) = m(p) * Q_{bT(p)}(X(p)) — learned soft mask,
+        # softmax-based + spatially smoothed
+        if self.smooth_transitions and self.soft_mask is not None:
+            m = self.soft_mask(bit_map, x)
+            x_quantized = x_quantized * m
+
         return x_quantized
     
     def extra_repr(self) -> str:
@@ -662,258 +726,3 @@ class SpatialAdaptiveQuantization(nn.Module):
         )
 
 
-class MixedPrecisionQuantizer(nn.Module):
-    """
-    Advanced mixed-precision quantizer with hardware awareness.
-    """
-    
-    def __init__(
-        self,
-        weight_quant: bool = True,
-        activation_quant: bool = True,
-        hardware_type: str = 'gpu',  # 'gpu', 'cpu', 'npu', 'edge', 'mobile'
-        symmetric: bool = True,
-        per_channel_weight: bool = True,
-        per_tensor_activation: bool = True
-    ):
-        """
-        Initialize mixed-precision quantizer.
-        
-        Args:
-            weight_quant: Whether to quantize weights
-            activation_quant: Whether to quantize activations
-            hardware_type: Target hardware platform
-            symmetric: Whether to use symmetric quantization
-            per_channel_weight: Per-channel quantization for weights
-            per_tensor_activation: Per-tensor quantization for activations
-        """
-        super().__init__()
-        self.weight_quant = weight_quant
-        self.activation_quant = activation_quant
-        self.hardware_type = hardware_type
-        self.symmetric = symmetric
-        
-        # Hardware-specific constraints
-        self.hardware_constraints = self._get_hardware_constraints()
-        
-        # Quantization modules
-        if weight_quant:
-            self.weight_quantizer = SpatialAdaptiveQuantization(
-                calibration_mode='minmax',
-                per_channel=per_channel_weight,
-                smooth_transitions=False
-            )
-        
-        if activation_quant:
-            self.activation_quantizer = SpatialAdaptiveQuantization(
-                calibration_mode='percentile',
-                per_channel=not per_tensor_activation,
-                smooth_transitions=True
-            )
-        
-        # Hardware-specific optimizations
-        self.optimizations = self._get_hardware_optimizations()
-    
-    def _get_hardware_constraints(self) -> Dict:
-        """Get hardware-specific constraints."""
-        constraints = {
-            'gpu': {
-                'supported_bits': [4, 8, 16],
-                'tile_size': 32,
-                'preferred_bits': 8,
-                'max_tile_bits_variance': 4,  # Max difference in bits between tiles
-                'supports_mixed_precision': True
-            },
-            'cpu': {
-                'supported_bits': [8, 16, 32],
-                'tile_size': 16,
-                'preferred_bits': 8,
-                'max_tile_bits_variance': 2,
-                'supports_mixed_precision': False
-            },
-            'npu': {
-                'supported_bits': [4, 8],
-                'tile_size': 64,
-                'preferred_bits': 4,
-                'max_tile_bits_variance': 4,
-                'supports_mixed_precision': True
-            },
-            'edge': {
-                'supported_bits': [2, 4, 8],
-                'tile_size': 8,
-                'preferred_bits': 4,
-                'max_tile_bits_variance': 2,
-                'supports_mixed_precision': True
-            },
-            'mobile': {
-                'supported_bits': [8, 16],
-                'tile_size': 16,
-                'preferred_bits': 8,
-                'max_tile_bits_variance': 0,
-                'supports_mixed_precision': False
-            }
-        }
-        return constraints.get(self.hardware_type, constraints['gpu'])
-    
-    def _get_hardware_optimizations(self) -> Dict:
-        """Get hardware-specific optimizations."""
-        optimizations = {
-            'gpu': {
-                'use_tensor_cores': True,
-                'fusion_enabled': True,
-                'cache_friendly_tiling': True
-            },
-            'cpu': {
-                'use_vectorization': True,
-                'fusion_enabled': False,
-                'cache_friendly_tiling': True
-            },
-            'npu': {
-                'use_tensor_cores': True,
-                'fusion_enabled': True,
-                'cache_friendly_tiling': False
-            },
-            'edge': {
-                'use_vectorization': False,
-                'fusion_enabled': False,
-                'cache_friendly_tiling': True
-            },
-            'mobile': {
-                'use_vectorization': True,
-                'fusion_enabled': False,
-                'cache_friendly_tiling': True
-            }
-        }
-        return optimizations.get(self.hardware_type, optimizations['gpu'])
-    
-    def adjust_bit_map_for_hardware(
-        self,
-        bit_map: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Adjust bit map to match hardware constraints.
-        
-        Args:
-            bit_map: Original bit allocation map
-            
-        Returns:
-            Hardware-compatible bit map
-        """
-        supported_bits = torch.tensor(
-            self.hardware_constraints['supported_bits'],
-            device=bit_map.device
-        )
-        
-        # Round to nearest supported bit-width
-        adjusted_map = bit_map.clone()
-        
-        for i in range(bit_map.shape[0]):
-            for j in range(bit_map.shape[1]):
-                for k in range(bit_map.shape[2]):
-                    current_bits = bit_map[i, j, k]
-                    
-                    # Find nearest supported bit width
-                    distances = torch.abs(supported_bits - current_bits)
-                    nearest_idx = torch.argmin(distances)
-                    adjusted_map[i, j, k] = supported_bits[nearest_idx]
-        
-        # Enforce maximum variance constraint if not supporting mixed precision
-        if not self.hardware_constraints['supports_mixed_precision']:
-            # Use uniform bit width (the mode)
-            mode_bits = torch.mode(adjusted_map.flatten())[0]
-            adjusted_map.fill_(mode_bits)
-        elif self.hardware_constraints['max_tile_bits_variance'] > 0:
-            # Limit variance between neighboring tiles
-            self._enforce_variance_constraint(adjusted_map)
-        
-        return adjusted_map
-    
-    def _enforce_variance_constraint(self, bit_map: torch.Tensor):
-        """Enforce maximum bit variance between neighboring tiles."""
-        max_var = self.hardware_constraints['max_tile_bits_variance']
-        
-        B, H, W = bit_map.shape
-        
-        # Iteratively smooth the bit map to respect variance constraints
-        for _ in range(5):  # Max iterations
-            changed = False
-            
-            for b in range(B):
-                for i in range(H):
-                    for j in range(W):
-                        current = bit_map[b, i, j]
-                        
-                        # Check neighbors
-                        neighbors = []
-                        if i > 0:
-                            neighbors.append(bit_map[b, i-1, j])
-                        if i < H-1:
-                            neighbors.append(bit_map[b, i+1, j])
-                        if j > 0:
-                            neighbors.append(bit_map[b, i, j-1])
-                        if j < W-1:
-                            neighbors.append(bit_map[b, i, j+1])
-                        
-                        if neighbors:
-                            # Adjust if variance is too high
-                            for neighbor in neighbors:
-                                if abs(current - neighbor) > max_var:
-                                    # Move current towards neighbor
-                                    if current > neighbor:
-                                        bit_map[b, i, j] = neighbor + max_var
-                                    else:
-                                        bit_map[b, i, j] = neighbor - max_var
-                                    changed = True
-            
-            if not changed:
-                break
-    
-    def forward(
-        self,
-        weights: Optional[torch.Tensor],
-        activations: Optional[torch.Tensor],
-        weight_bit_map: Optional[torch.Tensor],
-        activation_bit_map: Optional[torch.Tensor],
-        training: bool = True
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Quantize weights and activations with hardware awareness.
-        
-        Args:
-            weights: Weight tensor
-            activations: Activation tensor
-            weight_bit_map: Bit allocation for weights
-            activation_bit_map: Bit allocation for activations
-            training: Whether in training mode
-            
-        Returns:
-            Quantized weights and activations
-        """
-        # Adjust bit maps for hardware if provided
-        if weight_bit_map is not None:
-            weight_bit_map = self.adjust_bit_map_for_hardware(weight_bit_map)
-        
-        if activation_bit_map is not None:
-            activation_bit_map = self.adjust_bit_map_for_hardware(activation_bit_map)
-        
-        # Quantize weights
-        weights_q = weights
-        if self.weight_quant and weights is not None and weight_bit_map is not None:
-            weights_q = self.weight_quantizer(weights, weight_bit_map, training)
-        
-        # Quantize activations
-        activations_q = activations
-        if self.activation_quant and activations is not None and activation_bit_map is not None:
-            activations_q = self.activation_quantizer(
-                activations, activation_bit_map, training
-            )
-        
-        return weights_q, activations_q
-    
-    def get_hardware_info(self) -> Dict:
-        """Get hardware configuration information."""
-        return {
-            'hardware_type': self.hardware_type,
-            'constraints': self.hardware_constraints,
-            'optimizations': self.optimizations
-        }
