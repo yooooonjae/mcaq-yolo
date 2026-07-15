@@ -36,6 +36,12 @@ quantization:
 # Curriculum learning (3-stage schedule, paper Fig.3 / Algorithm 3)
 curriculum:
   enabled: true
+  score_backend: train  # 'train' (default: same metric backend the training
+                        # hooks use — single source of truth for the
+                        # curriculum signal) | 'gpu' | 'cv2' (exact Eq.21-24
+                        # reference, CPU-bound). Scores are now computed on an
+                        # AUGMENTATION-FREE copy of the train set and cached
+                        # with a (backend, imgsz, file-list) fingerprint.
   warmup_epochs: 20     # Stage 1 boundary (paper Table X: Twarm = 20)
   transition_epochs: 50 # Stage 2 boundary (paper Fig.3)
   initial_complexity: 0.2
@@ -61,6 +67,12 @@ scheduler:
 # Training settings
 training:
   amp: true  # Mixed precision training
+
+# Reproducibility (review fix): fixes random/numpy/torch(+CUDA) RNGs before
+# model init and dataloader construction; 'deterministic: true' additionally
+# requests deterministic kernels (slower). Omit 'seed' for legacy behavior.
+seed: 0
+deterministic: false
 
 # Hardware settings
 device: cuda

@@ -31,6 +31,7 @@ from ultralytics.cfg import DEFAULT_CFG
 from .models.mcaq_yolo import MCAQYOLO  # 네 레포의 MCAQ 모델
 from .core.curriculum import CurriculumScheduler
 from .utils.dataset import compute_dataset_complexity
+from .utils.repro import set_global_seed
 
 
 class Trainer:
@@ -44,6 +45,18 @@ class Trainer:
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config
+
+        # REVIEW FIX (reproducibility): fix all RNGs BEFORE any stochastic
+        # construction (weight init of the complexity/bit-mapping MLPs,
+        # dataloader shuffling, augmentation). config['seed'] (int) enables;
+        # config['deterministic'] (bool) additionally requests deterministic
+        # kernels. Absent -> legacy nondeterministic behavior.
+        seed = config.get("seed", None)
+        if seed is not None:
+            set_global_seed(int(seed), deterministic=bool(config.get("deterministic", False)))
+            print(f"[MCAQ] Global seed = {seed} "
+                  f"(deterministic={bool(config.get('deterministic', False))})")
+
         self.device = torch.device(config.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
 
         # --------------------------
@@ -348,6 +361,10 @@ class Trainer:
         train_img_path = os.path.join(dataset_root, train_img_rel)
         val_img_path = os.path.join(dataset_root, val_img_rel)
 
+        # Kept for the augmentation-free curriculum-scoring dataset (review fix)
+        self.train_img_path = train_img_path
+        self._data_dict = data_dict
+
         train_dataset = build_yolo_dataset(
             cfg=cfg_ns,
             img_path=train_img_path,
@@ -396,32 +413,108 @@ class Trainer:
     # ------------------------------------------------------------------
     # Complexity (커리큘럼용)
     # ------------------------------------------------------------------
+    def _build_scoring_dataset(self):
+        """
+        Augmentation-free dataset over the TRAIN images for curriculum scoring.
+
+        REVIEW FIX (measured defect): the previous code scored the train-mode
+        dataset directly, whose __getitem__ applies mosaic(=1.0)/flip/HSV —
+        fetching the same index twice differed by mean |delta| = 85/255, so
+        Algorithm 3's SortByComplexity ordered ONE random mosaic composite per
+        index, not the underlying image, and cached that snapshot. Building
+        the scoring dataset in mode='val' disables all augmentation; scores
+        are then deterministic properties of the raw (letterboxed) images.
+        """
+        cfg_ns = self._build_ultra_cfg()
+        return build_yolo_dataset(
+            cfg=cfg_ns,
+            img_path=self.train_img_path,
+            batch=1,
+            data=self._data_dict,
+            mode="val",   # mode drives augment=False inside ultralytics
+            rect=False,   # keep the square letterbox geometry of training
+            stride=32,
+        )
+
     def _compute_complexity_scores(self) -> torch.Tensor:
         """
-        Morphological complexity score를 전체 train dataset에 대해 계산.
-        이미 저장된 npy가 있으면 로드.
+        Morphological complexity score를 전체 train dataset에 대해 계산
+        (증강 미적용 스코어링 데이터셋 사용; 파일 경로로 train 순서에 정렬).
+        캐시는 (backend, imgsz, 파일 목록 md5) 메타와 함께 저장되며 어긋나면
+        자동 재계산한다 — 구버전의 무조건 재사용 캐시는 스코어링 방식이
+        바뀌어도 오염된 값을 계속 썼다.
         """
-        if self.complexity_path.exists():
-            print(f"[MCAQ] Loading complexity scores from {self.complexity_path}")
-            import numpy as np
+        import hashlib
+        import json
 
-            scores_np = np.load(self.complexity_path)
-            scores = torch.from_numpy(scores_np).float()
-            return scores.to(self.device)
+        # Backend policy: 'train' (default) = the analyzer's training-time
+        # backend (single source of truth for the curriculum signal);
+        # 'cv2'/'gpu' force that backend for scoring only.
+        # (Read from config directly: this method runs before the
+        # self.curriculum_cfg attribute is assigned in __init__.)
+        score_backend = str(
+            self.config.get("curriculum", {}).get("score_backend", "train")
+        ).lower()
+        backend_arg = None if score_backend == "train" else score_backend
+        analyzer_backend = getattr(
+            getattr(self.model, "complexity_analyzer", None), "metric_backend", "gpu"
+        )
+        effective_backend = backend_arg or analyzer_backend
 
-        print("[MCAQ] Computing complexity scores for curriculum learning...")
+        train_files = [str(Path(p).resolve()) for p in self.train_dataset.im_files]
+        files_md5 = hashlib.md5("\n".join(train_files).encode()).hexdigest()
+        meta = {
+            "version": 2,
+            "augment": False,
+            "backend": effective_backend,
+            "imgsz": self.imgsz,
+            "n": len(train_files),
+            "files_md5": files_md5,
+        }
+        meta_path = self.complexity_path.with_suffix(".meta.json")
+
+        if self.complexity_path.exists() and meta_path.exists():
+            try:
+                cached = json.loads(meta_path.read_text())
+            except Exception:
+                cached = None
+            if cached == meta:
+                print(f"[MCAQ] Loading complexity scores from {self.complexity_path}")
+                scores_np = np.load(self.complexity_path)
+                return torch.from_numpy(scores_np).float().to(self.device)
+            print("[MCAQ] Cached complexity scores are stale "
+                  "(backend/imgsz/file-list changed) — recomputing.")
+
+        print("[MCAQ] Computing complexity scores for curriculum learning "
+              f"(augment-free, backend={effective_backend})...")
+        scoring_ds = self._build_scoring_dataset()
+
         # Algorithm 3 line 1: SortByComplexity uses the unified morphological
-        # complexity C(x) (Eq.8) — pass the model so its analyzer scores images;
-        # the edge-density path remains as a fallback when model is None.
+        # complexity C(x) (Eq.8) via the model's analyzer.
         scores_np = compute_dataset_complexity(
-            dataset=self.train_dataset,
+            dataset=scoring_ds,
             model=self.model,
             batch_size=self.batch_size,
             device=str(self.device),
-            save_path=str(self.complexity_path),
+            save_path=None,          # saved below, in train order
+            backend=backend_arg,
         )
-        scores = torch.from_numpy(scores_np).float().to(self.device)
-        return scores
+
+        # Align scoring order to the TRAIN dataset order by file path.
+        score_files = [str(Path(p).resolve()) for p in scoring_ds.im_files]
+        by_path = {p: float(s) for p, s in zip(score_files, scores_np)}
+        missing = [p for p in train_files if p not in by_path]
+        if missing:
+            raise RuntimeError(
+                f"[MCAQ] {len(missing)} train images missing from the scoring "
+                f"dataset (first: {missing[0]}) — path alignment failed."
+            )
+        scores_np = np.asarray([by_path[p] for p in train_files], dtype=np.float32)
+
+        np.save(self.complexity_path, scores_np)
+        meta_path.write_text(json.dumps(meta, indent=2))
+        print(f"Saved complexity scores to {self.complexity_path}")
+        return torch.from_numpy(scores_np).float().to(self.device)
 
     def _make_teacher_hook(self, idx: int):
         """Store the teacher's feature map at backbone layer `idx` (FP32, frozen)."""
@@ -657,7 +750,7 @@ class Trainer:
         }
 
     @torch.no_grad()
-    def evaluate(self, quantize: bool = True) -> Dict[str, float]:
+    def evaluate(self, quantize: bool = True, temperature: float = 1.0) -> Dict[str, float]:
         """
         간단한 validation 루프 (mAP 등은 별도 모듈에서 측정해도 되고,
         여기서는 placeholder 형태로 둠)
@@ -665,6 +758,11 @@ class Trainer:
         Args:
             quantize: 학습 단계와 동일한 양자화 상태로 평가 (Stage 1 warm-up
                 동안에는 False — 학습/검증 불일치 방지, workflow finding [12])
+            temperature: REVIEW FIX — 기존에는 1.0으로 고정되어, 어닐링
+                중(Stage 2)에는 학습(alpha_t>1, 비트 상향 포화)과 검증이
+                서로 다른 양자화 레짐으로 돌았다("same regime" 주석과 모순;
+                epoch-1 val_loss 스파이크로 실측). 이제 에폭의 alpha_t를
+                그대로 받아 train/val 레짐을 일치시킨다.
         """
         self.model.eval()
         total_loss = 0.0
@@ -679,7 +777,7 @@ class Trainer:
                 imgs = imgs.float()
 
             with autocast(enabled=self.use_amp):
-                outputs, aux_info = self.model(imgs, temperature=1.0, quantize=quantize)
+                outputs, aux_info = self.model(imgs, temperature=temperature, quantize=quantize)
                 loss, loss_dict = self.model.loss_fn(
                     outputs,
                     batch,
@@ -712,7 +810,8 @@ class Trainer:
             # Validate under the same quantization regime as training
             # (Stage 1 warm-up: high precision)
             val_metrics = self.evaluate(
-                quantize=self.curriculum.get_stage(epoch) >= 2
+                quantize=self.curriculum.get_stage(epoch) >= 2,
+                temperature=self._get_curriculum_temperature(epoch),
             )
 
             if self.scheduler is not None:
@@ -742,6 +841,8 @@ def main(argv: Optional[list] = None) -> None:
     parser.add_argument("--config", required=True, help="Path to training config YAML")
     parser.add_argument("--device", default=None, help="Override config device (cpu / cuda / mps)")
     parser.add_argument("--output-dir", default=None, help="Override config output_dir")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Override config seed (review fix: reproducibility)")
     args = parser.parse_args(argv)
 
     with open(args.config, "r", encoding="utf-8") as f:
@@ -751,6 +852,8 @@ def main(argv: Optional[list] = None) -> None:
         config["device"] = args.device
     if args.output_dir is not None:
         config["output_dir"] = args.output_dir
+    if args.seed is not None:
+        config["seed"] = args.seed
 
     Trainer(config).train()
 

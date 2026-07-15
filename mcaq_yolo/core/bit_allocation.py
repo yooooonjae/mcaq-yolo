@@ -26,10 +26,15 @@ class LinearBitMapper(nn.Module):
     Algorithm 3 line 13, clamp, straight-through rounding).
     """
 
-    def __init__(self, min_bits: int = 2, max_bits: int = 8):
+    def __init__(self, min_bits: int = 2, max_bits: int = 8,
+                 eps_spread: float = 1e-3):
         super().__init__()
         self.min_bits = float(min_bits)
         self.max_bits = float(max_bits)
+        # Minimum 2-98% percentile spread below which the map is treated as
+        # spatially FLAT and mapped through absolute complexity instead of
+        # relative normalization (see forward; review fix).
+        self.eps_spread = float(eps_spread)
 
     def enforce_weight_constraints(self):
         """No-op (parameter-free); kept for interface parity (Eq.18)."""
@@ -50,7 +55,17 @@ class LinearBitMapper(nn.Module):
         flat = c.reshape(B, -1).float()
         lo = torch.quantile(flat, 0.02, dim=1, keepdim=True).unsqueeze(-1)
         hi = torch.quantile(flat, 0.98, dim=1, keepdim=True).unsqueeze(-1)
-        cn = ((c - lo) / (hi - lo + 1e-8)).clamp(0.0, 1.0)
+        spread = hi - lo
+        rel = ((c - lo) / (spread + 1e-8)).clamp(0.0, 1.0)
+        # REVIEW FIX (measured degenerate case): a spatially FLAT map
+        # (spread ~ 0, e.g. a uniform-texture scene) carries no relative
+        # structure, and relative normalization then collapsed EVERY tile to
+        # b_min regardless of absolute complexity (constant C=0.5 -> all
+        # 2-bit, measured) — maximal compression exactly where nothing says
+        # compression is safe. Hard gate: below eps_spread, map the ABSOLUTE
+        # complexity through the same affine so a uniformly mid-complexity
+        # image lands on mid bits. The gate is per image.
+        cn = torch.where(spread > self.eps_spread, rel, c.clamp(0.0, 1.0))
 
         bit_map = self.min_bits + (self.max_bits - self.min_bits) * cn
 

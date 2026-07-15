@@ -310,3 +310,40 @@ This project is licensed under the MIT License.
 ---
 
 **Note**: This is research code. While we strive for reliability, please use with appropriate caution in production environments.
+
+## v0.2.0 — Review patch notes (2026-07)
+
+Behavior-changing fixes from an independent code review. **Numbers produced
+with v0.1.x are not directly comparable** where noted.
+
+- **Surrogate/reference parity (behavior change).** The GPU morphology
+  surrogates now replicate the cv2 recipe's operator semantics
+  (`canny_impl='cv2compat'`: intensity-Otsu thresholds consumed in L1
+  gradient units; `binarize_impl='adaptive'`: tensorized
+  `adaptiveThreshold(GAUSSIAN,11,2)`; `contour_components=True`:
+  Euler-number K correction toward Eq.24's per-contour mean). Measured on
+  natural images, fused-map correlation gpu-vs-cv2 improved from r≈0.45 to
+  r≈0.88. Pre-review dynamics remain available via
+  `canny_impl='legacy', binarize_impl='otsu', contour_components=False`.
+- **Curriculum scores are augmentation-free (behavior change).** Algorithm 3's
+  SortByComplexity previously ordered one random mosaic composite per index;
+  scores now come from a val-mode (no-augment) copy of the train set, are
+  path-aligned to train order, and the cache self-invalidates on
+  backend/imgsz/file-list changes (`curriculum.score_backend: train|gpu|cv2`).
+- **Reproducibility.** `seed`/`deterministic` config keys and `--seed` CLI;
+  see `mcaq_yolo/utils/repro.py` for stated limits.
+- **Validation regime match.** `Trainer.evaluate()` now receives the epoch's
+  annealed temperature instead of a fixed 1.0.
+- **Flat-map bit allocation.** `LinearBitMapper` maps spatially flat
+  complexity through absolute values (uniform C=0.5 → 5-bit) instead of
+  collapsing to `b_min`.
+- **Packaging.** `import mcaq_yolo` no longer requires `ultralytics`
+  (PEP 562 lazy model/trainer); `pip install .` works without torch/nvcc
+  (CUDA kernel builds only when a toolchain is present; `MCAQ_SKIP_CUDA=1`
+  to skip); `pip install -e .[dev]` brings pytest; line endings normalized.
+- **CPU note.** Set `amp: false` in the config when training on CPU.
+- **Diagnostics.** `python -m mcaq_yolo.scripts.backend_agreement --data
+  data.yaml` reports per-metric surrogate/reference correlations (use
+  `--legacy` to reproduce the pre-fix gap). After training, call
+  `model.complexity_analyzer.fit_feature_weights(loader)` to refit Eq.8's
+  α to the trained MLP before recomputing curriculum scores.

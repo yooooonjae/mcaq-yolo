@@ -78,19 +78,23 @@ def extract_targets_per_image(batch, batch_size: int, img_w: int, img_h: int) ->
 # mAP — standard per-class AP with all-point interpolation
 # ---------------------------------------------------------------------------
 
-def _ap_from_pr(recall: np.ndarray, precision: np.ndarray) -> float:
+def _ap_from_pr(recall: np.ndarray, precision: np.ndarray,
+                interp: str = "voc") -> float:
     """
-    All-point (VOC-2010-style) interpolated AP: area under the monotone
-    precision envelope. NOTE: COCO's official metric uses 101-point linear
-    interpolation (np.interp(np.linspace(0, 1, 101), r, p).mean()), which can
-    differ by ~0.001-0.003 on dense PR curves; results here are internally
-    consistent but VOC-style.
+    interp='voc' (default, backwards compatible): all-point VOC-2010 area
+    under the monotone precision envelope.
+    interp='coco' (REVIEW FIX): COCO's official 101-point linear
+    interpolation — use this whenever numbers are compared against
+    pycocotools / Ultralytics validators; the two differ by ~0.001-0.003 on
+    dense PR curves, which matters at paper-table precision.
     """
     r = np.concatenate(([0.0], recall, [1.0]))
     p = np.concatenate(([1.0], precision, [0.0]))
     # Monotone non-increasing precision envelope
     for i in range(len(p) - 2, -1, -1):
         p[i] = max(p[i], p[i + 1])
+    if interp == "coco":
+        return float(np.interp(np.linspace(0.0, 1.0, 101), r, p).mean())
     idx = np.where(r[1:] != r[:-1])[0]
     return float(np.sum((r[idx + 1] - r[idx]) * p[idx + 1]))
 
@@ -99,6 +103,7 @@ def compute_map(
     detections: List[torch.Tensor],
     targets: List[torch.Tensor],
     iou_thresholds: Optional[List[float]] = None,
+    interp: str = "voc",
 ) -> Dict[str, float]:
     """
     Compute mAP over a dataset.
@@ -172,7 +177,7 @@ def compute_map(
             fp_cum = np.cumsum(fp)
             recall = tp_cum / (n_gt + 1e-10)
             precision = tp_cum / (tp_cum + fp_cum + 1e-10)
-            aps.append(_ap_from_pr(recall, precision))
+            aps.append(_ap_from_pr(recall, precision, interp=interp))
 
         maps_per_thresh.append(float(np.mean(aps)) if aps else 0.0)
 

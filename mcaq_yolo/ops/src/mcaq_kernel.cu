@@ -20,16 +20,23 @@ __global__ void SpatialAdaptiveQuantizationKernel(
     int tile_h, int tile_w,
     int n_tiles_h, int n_tiles_w            // 실제 bit_map 그리드 크기 (N, Ht, Wt)
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total_elements = batch * channels * height * width;
-
-    if (idx >= total_elements) return;
+    // REVIEW FIX (int32 overflow + launch-grid coupling): the previous
+    // `int idx` / `int total_elements` overflow for N*C*H*W >= 2^31 and
+    // required the launch grid to cover every element. 64-bit grid-stride
+    // loop is correct for any tensor size and any grid.
+    // NOTE: not compiled in the review environment (no nvcc available) —
+    // semantics are unchanged w.r.t. the numerically verified PyTorch path.
+    const long long total_elements =
+        (long long)batch * channels * height * width;
+    for (long long idx = blockIdx.x * (long long)blockDim.x + threadIdx.x;
+         idx < total_elements;
+         idx += (long long)blockDim.x * gridDim.x) {
 
     // 좌표 계산
-    int w = idx % width;
-    int h = (idx / width) % height;
-    int c = (idx / (width * height)) % channels;
-    int n = idx / (width * height * channels);
+    int w = (int)(idx % width);
+    int h = (int)((idx / width) % height);
+    int c = (int)((idx / ((long long)width * height)) % channels);
+    int n = (int)(idx / ((long long)width * height * channels));
 
     // 1. 해당 픽셀의 비트 심도(Bit-width) 조회
     // bit_map은 다운샘플링된 타일 그리드이므로 인덱스 변환 필요.
@@ -81,11 +88,14 @@ __global__ void SpatialAdaptiveQuantizationKernel(
     float deq = (q_val - zero_point) * scale;
 
     // 4. Paper Listing 2 / Eq.(19): fused learned soft-mask multiply
+    // (mask index in 64-bit as well — (n*H+h)*W+w overflows int32 for the
+    // same tensor sizes the grid-stride fix targets)
     if (mask != nullptr) {
-        deq *= mask[(n * height + h) * width + w];
+        deq *= mask[((long long)n * height + h) * width + w];
     }
 
     output[idx] = deq;
+    }  // grid-stride loop
 }
 
 // C++ Wrapper에서 호출할 함수
@@ -99,9 +109,12 @@ void launch_spatial_quantization(
     int n_tiles_h, int n_tiles_w,
     cudaStream_t stream
 ) {
-    int total_elements = N * C * H * W;
-    int threads = 1024;
-    int blocks = (total_elements + threads - 1) / threads;
+    const long long total_elements = (long long)N * C * H * W;
+    const int threads = 256;
+    long long want = (total_elements + threads - 1) / threads;
+    // Grid-stride kernel: cap the grid, the loop covers any remainder.
+    int blocks = (int)(want < (long long)(1 << 20) ? want : (long long)(1 << 20));
+    if (blocks < 1) blocks = 1;
 
     SpatialAdaptiveQuantizationKernel<<<blocks, threads, 0, stream>>>(
         input, bit_map, min_vals, max_vals, mask, output,

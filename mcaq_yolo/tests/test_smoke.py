@@ -195,3 +195,30 @@ def test_linear_bit_mapper_spatial_variance():
     b = m(c, temperature=1.0)
     assert float(b.min()) == 2.0 and float(b.max()) == 8.0  # normalization spreads it
     assert torch.unique(b).numel() >= 5
+
+
+def test_linear_bit_mapper_flat_map_absolute_fallback():
+    """REVIEW FIX check (measured degenerate case): a spatially FLAT
+    complexity map must route through ABSOLUTE complexity (C=0.5 -> mid
+    bits), not collapse every tile to b_min as before."""
+    from mcaq_yolo.core.bit_allocation import LinearBitMapper
+
+    m = LinearBitMapper(min_bits=2, max_bits=8)
+    bits = m(torch.full((1, 8, 8), 0.5))
+    assert int(bits.min()) == 5 and int(bits.max()) == 5, (
+        f"flat C=0.5 should map to uniform 5-bit, got {bits.unique().tolist()}"
+    )
+    assert int(m(torch.full((1, 8, 8), 0.0)).max()) == 2
+    assert int(m(torch.full((1, 8, 8), 1.0)).min()) == 8
+
+
+def test_contour_euler_component_count():
+    """Euler-number component counting (Gray's quad algorithm) used by the
+    contour surrogate's K correction: interior blobs count exactly."""
+    from mcaq_yolo.core.morphology import MorphologicalComplexityAnalyzer as M
+
+    m = torch.zeros(1, 1, 16, 16)
+    m[0, 0, 2:6, 2:6] = 1
+    assert float(M._euler_components_tiles(m, 16)) == 1.0
+    m[0, 0, 10:14, 10:14] = 1
+    assert float(M._euler_components_tiles(m, 16)) == 2.0

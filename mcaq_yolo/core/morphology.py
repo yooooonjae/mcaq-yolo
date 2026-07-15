@@ -33,6 +33,9 @@ class MorphologicalComplexityAnalyzer(nn.Module):
         cache_size: int = 10000,   # Paper Table X: cache size 10,000 entries
         device: str = "cuda",
         metric_backend: str = "gpu",  # 'gpu' (vectorized surrogates) | 'cv2' (exact Eq.21-24)
+        canny_impl: str = "cv2compat",    # 'cv2compat' (default) | 'legacy'
+        binarize_impl: str = "adaptive",  # 'adaptive' (cv2 parity) | 'otsu' (legacy)
+        contour_components: bool = True,  # Euler-number K correction toward Eq.24's per-contour mean
     ):
         """
         Initialize the morphological complexity analyzer.
@@ -56,6 +59,13 @@ class MorphologicalComplexityAnalyzer(nn.Module):
         self.grid_size = grid_size
         self.device = device
         self.metric_backend = metric_backend
+        # Backend-parity controls (review finding: fused-map correlation between
+        # the training-time GPU surrogates and the offline cv2 reference was
+        # only r~0.45 with the legacy edge/contour surrogates; 'cv2compat'
+        # replicates cv2's operator semantics on tensors instead):
+        self.canny_impl = canny_impl
+        self.binarize_impl = binarize_impl
+        self.contour_components = contour_components
         self.cache = {}
         self.cache_size = cache_size
 
@@ -86,10 +96,16 @@ class MorphologicalComplexityAnalyzer(nn.Module):
         nn.init.xavier_uniform_(self.complexity_mlp[-2].weight, gain=3.0)
         nn.init.zeros_(self.complexity_mlp[-2].bias)
 
-        # Eq.(8) weights alpha_i (sum=1, >=0 enforced at use site). Used for the
-        # deterministic dataset-scoring path (Algorithm 3 line 1 SortByComplexity);
-        # the training-time score itself comes from the MLP (Algorithm 1 line 15).
-        self.feature_weights = nn.Parameter(torch.ones(5) / 5)
+        # Eq.(8) weights alpha_i (sum=1, >=0). Used only by the deterministic
+        # dataset-scoring path (Algorithm 3 line 1 SortByComplexity); the
+        # training-time score comes from the MLP (Algorithm 1 line 15).
+        # REVIEW FIX: this was an nn.Parameter that never received a gradient
+        # (used exclusively under no_grad/.detach()) — a dead parameter that
+        # sat in the optimizer and checkpoints while implying learnability.
+        # It is now a buffer; call fit_feature_weights() after training to
+        # refit alpha to the trained MLP (constrained least squares), so
+        # offline sorting reflects the learned notion of complexity.
+        self.register_buffer("feature_weights", torch.ones(5) / 5)
 
     def fast_fractal_dimension(self, edge_map: np.ndarray) -> float:
         """
@@ -412,45 +428,10 @@ class MorphologicalComplexityAnalyzer(nn.Module):
         thr = cls._otsu_threshold(x, bins)
         return (x > thr).float()
 
-    @classmethod
-    def _gpu_canny(cls, gray: torch.Tensor) -> torch.Tensor:
-        """
-        Tensorized Canny edge detection with Otsu-adaptive double thresholds
-        (paper Eq.23 / Algorithm 2 input: 'Canny edge detection with adaptive
-        thresholds based on the Otsu method', Gaussian sigma=1.0):
-
-          1. 5x5 Gaussian blur (sigma=1.0, matching the cv2 path)
-          2. Sobel gradients -> magnitude + direction
-          3. Non-maximum suppression along 4 quantized gradient directions
-          4. Double threshold: high = per-image Otsu, low = 0.5 * high
-          5. Hysteresis: weak edges kept when 8-connected to strong edges
-             (two dilation passes — bounded approximation of full flood fill)
-
-        DOCUMENTED DEVIATIONS from the cv2 reference recipe (compute_edge_density):
-        - the Otsu threshold here is taken on the NMS gradient-magnitude
-          distribution (separates edge/non-edge bimodality directly in the
-          domain being thresholded), whereas the cv2 recipe derives it from the
-          blurred *intensity* histogram and hands it to cv2.Canny — the two are
-          not numerically identical;
-        - hysteresis is bounded to two dilation passes instead of the full
-          flood fill. Exact behavior: metric_backend='cv2'.
-
-        gray: (B,1,H,W) in [0,1]. Returns float {0,1} edge map.
-        """
-        dev = gray.device
-        # 1) Gaussian blur 5x5, sigma=1.0
-        x1 = torch.arange(5, dtype=torch.float32, device=dev) - 2
-        g1 = torch.exp(-(x1**2) / 2.0)
-        g1 = g1 / g1.sum()
-        g2 = (g1.unsqueeze(0) * g1.unsqueeze(1)).view(1, 1, 5, 5)
-        blurred = F.conv2d(gray, g2, padding=2)
-
-        # 2) Sobel magnitude + direction
-        gx, gy = cls._sobel(blurred)
-        mag = torch.sqrt(gx**2 + gy**2 + 1e-12)
-
-        # 3) Non-maximum suppression: quantize direction into 4 bins and
-        #    compare with both neighbors along the gradient direction
+    @staticmethod
+    def _canny_nms(mag: torch.Tensor, gx: torch.Tensor, gy: torch.Tensor) -> torch.Tensor:
+        """Non-maximum suppression along 4 quantized gradient directions
+        (shared by both Canny implementations). mag/gx/gy: (B,1,H,W)."""
         angle = torch.atan2(gy, gx) * (180.0 / math.pi)
         angle = torch.where(angle < 0, angle + 180.0, angle)
 
@@ -470,20 +451,131 @@ class MorphologicalComplexityAnalyzer(nn.Module):
         for sel, (dy1, dx1), (dy2, dx2) in bins:
             keep = (mag >= shift(mag, dy1, dx1)) & (mag >= shift(mag, dy2, dx2))
             nms = torch.where(sel & keep, mag, nms)
+        return nms
 
-        # 4) Otsu double threshold on the NMS magnitude:
-        #    high = Otsu threshold, low = 0.5 * high (matching the cv2 path)
+    def _gpu_canny(self, gray: torch.Tensor) -> torch.Tensor:
+        """Dispatch to the cv2-compatible (default) or legacy tensorized Canny."""
+        if self.canny_impl == "legacy":
+            return self._gpu_canny_legacy(gray)
+        return self._gpu_canny_cv2compat(gray)
+
+    @classmethod
+    def _gpu_canny_cv2compat(cls, gray: torch.Tensor, hysteresis_iters: int = 8) -> torch.Tensor:
+        """
+        Tensorized Canny that replicates the cv2 reference recipe's OPERATOR
+        SEMANTICS (compute_edge_density), removing the legacy deviations that
+        drove the measured backend divergence (review finding: edge-density
+        correlation gpu-vs-cv2 was r~0.5 with a ~2x scale offset):
+
+          1. work in the 0..255 intensity domain (matching the uint8 path)
+          2. 5x5 Gaussian blur, sigma=1.0
+          3. Otsu threshold t computed on the BLURRED INTENSITY histogram
+             (exactly what the cv2 recipe hands to cv2.Canny) — not on the
+             gradient magnitude as in the legacy implementation
+          4. Sobel (ksize=3) on the blurred image; L1 magnitude |gx|+|gy|
+             (cv2.Canny default L2gradient=False) — not the legacy L2
+          5. NMS; double threshold applied to the L1 magnitude with
+             high = t, low = 0.5 * t in the SAME 0..255 units (cv2 semantics:
+             the intensity-derived thresholds are consumed in gradient units)
+          6. hysteresis via `hysteresis_iters` dilation passes (default 8,
+             near-converged for tile-level statistics; cv2 does a full flood
+             fill — residual difference documented)
+
+        gray: (B,1,H,W) in [0,1] (per-image min-max normalized upstream, which
+        mirrors the cv2 path's per-image uint8 conversion). Returns {0,1} map.
+        """
+        dev = gray.device
+        b01 = None
+        # 1-2) blur in [0,1], then move to 0..255 units
+        x1 = torch.arange(5, dtype=torch.float32, device=dev) - 2
+        g1 = torch.exp(-(x1**2) / 2.0)
+        g1 = g1 / g1.sum()
+        g2 = (g1.unsqueeze(0) * g1.unsqueeze(1)).view(1, 1, 5, 5)
+        b01 = F.conv2d(gray, g2, padding=2)          # blurred, [0,1]
+        b255 = b01 * 255.0
+
+        # 3) Otsu on the blurred INTENSITY histogram -> threshold in 0..255
+        thr255 = cls._otsu_threshold(b01) * 255.0    # (B,1,1,1)
+
+        # 4) Sobel on the blurred image, L1 magnitude (cv2 default)
+        gx, gy = cls._sobel(b255)
+        mag = gx.abs() + gy.abs()
+
+        # 5) NMS + double threshold in gradient units
+        nms = cls._canny_nms(mag, gx, gy)
+        strong = (nms > thr255).float()
+        weak = (nms > 0.5 * thr255).float()
+
+        # 6) hysteresis: weak pixels kept when 8-connected to a strong pixel
+        edge = strong
+        for _ in range(max(1, hysteresis_iters)):
+            grown = F.max_pool2d(edge, kernel_size=3, stride=1, padding=1)
+            edge = torch.where((weak > 0) & (grown > 0), torch.ones_like(edge), edge)
+        return edge
+
+    @classmethod
+    def _gpu_canny_legacy(cls, gray: torch.Tensor) -> torch.Tensor:
+        """
+        LEGACY implementation (pre-review): Otsu taken on the normalized NMS
+        gradient-magnitude distribution, L2 magnitude, 2 hysteresis passes.
+        Kept only for reproducing pre-fix training runs
+        (canny_impl='legacy'); measured fused-map correlation with the cv2
+        reference was r~0.45 — prefer 'cv2compat'.
+        """
+        dev = gray.device
+        x1 = torch.arange(5, dtype=torch.float32, device=dev) - 2
+        g1 = torch.exp(-(x1**2) / 2.0)
+        g1 = g1 / g1.sum()
+        g2 = (g1.unsqueeze(0) * g1.unsqueeze(1)).view(1, 1, 5, 5)
+        blurred = F.conv2d(gray, g2, padding=2)
+
+        gx, gy = cls._sobel(blurred)
+        mag = torch.sqrt(gx**2 + gy**2 + 1e-12)
+        nms = cls._canny_nms(mag, gx, gy)
+
         nms_n = cls._normalize01(nms)
         thr_high = cls._otsu_threshold(nms_n)
         strong = (nms_n > thr_high).float()
         weak = (nms_n > 0.5 * thr_high).float()
 
-        # 5) Hysteresis: weak pixels kept when 8-connected to a strong pixel
         edge = strong
         for _ in range(2):
             grown = F.max_pool2d(edge, kernel_size=3, stride=1, padding=1)
             edge = torch.where((weak > 0) & (grown > 0), torch.ones_like(edge), edge)
         return edge
+
+    def _binarize(self, gray: torch.Tensor) -> torch.Tensor:
+        """Foreground mask for phi5. Default 'adaptive' replicates the cv2
+        recipe (compute_contour_complexity uses cv2.adaptiveThreshold);
+        'otsu' keeps the legacy global threshold."""
+        if self.binarize_impl == "otsu":
+            return self._otsu_binarize(gray)
+        return self._adaptive_binarize(gray)
+
+    @staticmethod
+    def _adaptive_binarize(gray: torch.Tensor, block: int = 11, C: float = 2.0) -> torch.Tensor:
+        """
+        Tensor replica of cv2.adaptiveThreshold(ADAPTIVE_THRESH_GAUSSIAN_C,
+        THRESH_BINARY, blockSize=11, C=2): dst = 1 iff src > G11(src) - C in
+        0..255 units, where G11 is the 11x11 Gaussian-weighted local mean with
+        cv2.getGaussianKernel's default sigma = 0.3*((k-1)*0.5 - 1) + 0.8
+        (= 2.0 for k=11) and replicate borders (cv2's border mode).
+
+        DOCUMENTED RESIDUAL DIFFERENCE: the cv2 reference applies this
+        per-tile (replicate borders at every tile edge); here it runs on the
+        whole image, so tiles see true neighbors instead of artificial
+        borders — arguably better, but not bit-identical near tile edges.
+        """
+        g255 = gray * 255.0
+        k = block
+        sigma = 0.3 * ((k - 1) * 0.5 - 1) + 0.8
+        x = torch.arange(k, dtype=torch.float32, device=gray.device) - k // 2
+        g1 = torch.exp(-(x**2) / (2 * sigma**2))
+        g1 = g1 / g1.sum()
+        g2 = (g1.unsqueeze(0) * g1.unsqueeze(1)).view(1, 1, k, k)
+        p = k // 2
+        local_mean = F.conv2d(F.pad(g255, (p, p, p, p), mode="replicate"), g2)
+        return (g255 > local_mean - C).float()
 
     @staticmethod
     def _fractal_dimension_tiles(edge: torch.Tensor, tile: int) -> torch.Tensor:
@@ -583,17 +675,57 @@ class MorphologicalComplexityAnalyzer(nn.Module):
         return v / (v + 1.0)
 
     @staticmethod
-    def _contour_complexity_tiles(binmask: torch.Tensor, tile: int) -> torch.Tensor:
+    def _euler_components_tiles(m: torch.Tensor, tile: int) -> torch.Tensor:
         """
-        phi5: Eq.(24) inverse circularity P^2/(4*pi*A) per tile.
+        Per-tile count K of 8-connected foreground components via the Euler
+        number (Gray's quad-pattern algorithm), fully vectorized:
 
-        DOCUMENTED APPROXIMATION (K=1): the tile's foreground is treated as a
-        single region, whereas Eq.(24) averages over K individually detected
-        contours — pure tensor pooling cannot enumerate contours, and when a
-        tile contains several blobs this differs from the per-contour mean.
-        The exact per-contour path is compute_contour_complexity (cv2), used
-        by metric_backend='cv2' for offline scoring/calibration. Normalized to
-        [0,1) via 1 - 1/ic, consistent with the cv2 path (see its comment).
+            E8 = (Q1 - Q3 - 2*QD) / 4
+
+        over all 2x2 windows of the zero-padded mask, where Q1/Q3 are windows
+        with exactly one/three foreground pixels and QD the two diagonal
+        patterns. For hole-free blobs E8 equals the component count, matching
+        cv2.findContours(RETR_EXTERNAL)'s 8-connectivity convention.
+
+        Windows are attributed to the tile of their top-left pixel; a blob
+        straddling a tile boundary therefore contributes FRACTIONAL Euler mass
+        to each tile (summing to 1 globally), whereas the cv2 reference clips
+        it into one contour per tile — a documented residual difference.
+        Holes (E < K) and blobs touching the image's bottom/right border can
+        under-count; clamp(min=1) below area>0 guards the division.
+
+        m: (B,1,Hc,Wc) float {0,1}. Returns (B,1,ht,wt) with K >= 1.
+        """
+        mp = F.pad(m, (1, 1, 1, 1))  # zero pad closes blobs at image borders
+        kernel = torch.tensor([[1.0, 2.0], [4.0, 8.0]], device=m.device).view(1, 1, 2, 2)
+        idx = F.conv2d(mp, kernel)  # (B,1,H+1,W+1), pattern index 0..15
+        onehot = F.one_hot(idx.long().squeeze(1), num_classes=16)
+        onehot = onehot.permute(0, 3, 1, 2).float()
+        q1 = onehot[:, [1, 2, 4, 8]].sum(dim=1, keepdim=True)
+        q3 = onehot[:, [7, 11, 13, 14]].sum(dim=1, keepdim=True)
+        qd = onehot[:, [6, 9]].sum(dim=1, keepdim=True)
+        e = (q1 - q3 - 2.0 * qd) / 4.0  # per-window Euler contribution
+
+        ht, wt = m.shape[-2] // tile, m.shape[-1] // tile
+        e = e[:, :, : ht * tile, : wt * tile]
+        K = F.avg_pool2d(e, kernel_size=tile, stride=tile) * (tile * tile)
+        return K.round().clamp(min=1.0)
+
+    def _contour_complexity_tiles(self, binmask: torch.Tensor, tile: int) -> torch.Tensor:
+        """
+        phi5: Eq.(24) MEAN inverse circularity (1/K) * sum_k Pk^2/(4*pi*Ak)
+        per tile.
+
+        REVIEW FIX (was: K=1 single-region approximation, measured contour
+        correlation gpu-vs-cv2 r~0.45 with means 0.26 vs 0.71): for K blobs of
+        comparable shape (perimeter p, area a each), the single-region value
+        (Kp)^2 / (4*pi*Ka) = K * [p^2/(4*pi*a)] overestimates Eq.(24)'s
+        per-contour mean by exactly the factor K. We therefore estimate K per
+        tile with the Euler number (_euler_components_tiles) and divide —
+        recovering the mean exactly under the equal-blob assumption, and a
+        first-order correction otherwise. Set contour_components=False for the
+        legacy single-region behavior. Exact per-contour path remains the cv2
+        backend. Normalized to [0,1) via 1 - 1/ic (see cv2 path comment).
         """
         m = binmask  # (B,1,Hc,Wc) float {0,1}
         eroded = -F.max_pool2d(-m, kernel_size=3, stride=1, padding=1)
@@ -602,7 +734,10 @@ class MorphologicalComplexityAnalyzer(nn.Module):
         area = F.avg_pool2d(m, kernel_size=tile, stride=tile) * (tile * tile)
         perim = F.avg_pool2d(boundary, kernel_size=tile, stride=tile) * (tile * tile)
 
-        ic = (perim * perim) / (4.0 * math.pi * area + 1e-6)  # Eq.(24)
+        ic = (perim * perim) / (4.0 * math.pi * area + 1e-6)  # Eq.(24), K=1 form
+        if self.contour_components:
+            K = self._euler_components_tiles(m, tile)
+            ic = ic / K
         phi5 = 1.0 - 1.0 / ic.clamp(min=1.0)
         # Empty tiles (no foreground) -> 0 complexity
         phi5 = torch.where(area.squeeze(1) > 0, phi5.squeeze(1), torch.zeros_like(phi5.squeeze(1)))
@@ -712,10 +847,12 @@ class MorphologicalComplexityAnalyzer(nn.Module):
 
             # Edge map for phi1/phi4: tensorized Canny with Otsu-adaptive
             # thresholds (Eq.23 / Algorithm 2 input) — blur, NMS, double
-            # threshold, hysteresis. See _gpu_canny.
+            # threshold, hysteresis. Default 'cv2compat' replicates the cv2
+            # recipe's operator semantics; see _gpu_canny_cv2compat.
             edge = self._gpu_canny(gray)
-            # Foreground mask for phi5 (cv2 path uses adaptive threshold on gray)
-            binmask = self._otsu_binarize(gray)
+            # Foreground mask for phi5 — default replicates the cv2 recipe's
+            # adaptiveThreshold(GAUSSIAN, 11, 2); see _binarize.
+            binmask = self._binarize(gray)
 
             phi1 = self._fractal_dimension_tiles(edge, tile) / 2.0  # Df/2 in [0.5,1]
             phi2 = self._lbp_entropy_tiles(gray, tile)
@@ -740,12 +877,60 @@ class MorphologicalComplexityAnalyzer(nn.Module):
         }
         return phi, detailed
 
+    @torch.no_grad()
+    def fit_feature_weights(self, batches, max_batches: int = 64):
+        """
+        Post-hoc Eq.(8) alpha fit (REVIEW FIX for the dead-parameter issue):
+        solve   min_alpha || Phi @ alpha - C_mlp ||^2   s.t. alpha >= 0
+        via scipy NNLS over tiles sampled from `batches`, then project onto
+        the simplex (sum alpha = 1). Afterwards score_image's deterministic
+        Eq.(8) sorting reflects the TRAINED MLP's notion of complexity instead
+        of a frozen uniform 1/5. Call after training, before recomputing
+        curriculum scores or reporting Eq.(8)-based analyses.
+
+        Args:
+            batches: iterable of (B,C,H,W) tensors (e.g. images from a loader)
+            max_batches: cap on batches consumed
+
+        Returns:
+            np.ndarray (5,) fitted alpha (also written into feature_weights)
+        """
+        Ps, Cs = [], []
+        for i, x in enumerate(batches):
+            if isinstance(x, dict):
+                x = x.get("img")
+            x = x.float()
+            if x.dim() == 3:
+                x = x.unsqueeze(0)
+            if x.max() > 1.5:
+                x = x / 255.0
+            x = x.to(next(self.complexity_mlp.parameters()).device)
+            phi, _ = self.compute_phi_tiles(x)
+            c = self.complexity_mlp(phi.reshape(-1, 8))  # pre-bilateral target
+            Ps.append(phi[..., :5].reshape(-1, 5).cpu())
+            Cs.append(c.reshape(-1, 1).cpu())
+            if i + 1 >= max_batches:
+                break
+
+        P = torch.cat(Ps).double().numpy()
+        C = torch.cat(Cs).double().numpy().ravel()
+        from scipy.optimize import nnls
+
+        alpha, _ = nnls(P, C)
+        s = float(alpha.sum())
+        alpha = alpha / s if s > 1e-12 else np.ones(5) / 5.0
+        self.feature_weights.copy_(
+            torch.as_tensor(alpha, dtype=self.feature_weights.dtype,
+                            device=self.feature_weights.device)
+        )
+        return alpha
+
     def score_image(self, features: torch.Tensor) -> torch.Tensor:
         """
         Deterministic per-image unified complexity for dataset sorting
         (Algorithm 3 line 1 SortByComplexity). Uses Eq.(8) C = sum alpha_i * phi_i
-        with the alpha_i parameters (init 1/5, projected to the simplex), averaged
-        over tiles. Deterministic w.r.t. the (untrained) MLP.
+        with the alpha_i buffer (init 1/5; refit to the trained MLP via
+        fit_feature_weights), averaged over tiles.
 
         Returns: (B,) tensor in [0,1].
         """

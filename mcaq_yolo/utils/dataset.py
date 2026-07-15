@@ -278,6 +278,7 @@ def compute_dataset_complexity(
     batch_size: int = 1,
     device: str = "cuda",
     save_path: Optional[str] = None,
+    backend: Optional[str] = None,
 ) -> np.ndarray:
     """
     Dataset 전체에 대해 complexity score 계산 (Algorithm 3 line 1: SortByComplexity).
@@ -285,6 +286,13 @@ def compute_dataset_complexity(
     - model이 주어지면 model.complexity_analyzer.score_image()로 통합 형태학
       복잡도 C(x) (Eq.8, 5개 메트릭의 정규화 가중합)를 사용.
     - model=None이면 단순 edge density 기반 폴백.
+
+    backend (REVIEW FIX): None(기본)은 analyzer의 현재(=학습 시) metric_backend를
+    그대로 사용 — 커리큘럼 정렬이 학습이 실제로 보는 복잡도 신호와 동일한
+    측정으로 이루어지도록 하는 단일 신호원(single source of truth) 원칙.
+    'cv2' / 'gpu'를 명시하면 스코어링 동안만 해당 백엔드로 일시 전환한다.
+    (구버전은 무조건 'cv2'로 강제 전환했는데, cv2compat 패리티 패치 이전에는
+    학습 신호와의 융합 맵 상관이 r~0.45에 불과해 정렬-학습 불일치를 낳았다.)
     """
     print(f"Computing complexity for {len(dataset)} samples...")
 
@@ -297,11 +305,12 @@ def compute_dataset_complexity(
     if analyzer is not None and not hasattr(analyzer, "score_image"):
         analyzer = None  # incompatible object — fall back to edge density
 
-    # Offline scoring can afford the exact cv2 metrics (Eq.21-24; paper runs
-    # morphological analysis at calibration time) — switch backend temporarily.
+    # Backend for offline scoring: keep the analyzer's training-time backend
+    # unless the caller explicitly requests 'cv2' (exact Eq.21-24 reference)
+    # or 'gpu'. Consistency with the training signal is the default.
     prev_backend = getattr(analyzer, "metric_backend", None)
-    if analyzer is not None and prev_backend is not None:
-        analyzer.metric_backend = "cv2"
+    if analyzer is not None and prev_backend is not None and backend is not None:
+        analyzer.metric_backend = backend
 
     # 반드시 batch_size=1: _collate_fn이 batch_list[0]만 반환하므로 batch_size>1이면
     # 배치당 1개 score만 계산되어 dataset 인덱스와 score 배열이 어긋난다
