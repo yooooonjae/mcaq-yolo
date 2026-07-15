@@ -1,4 +1,6 @@
 #include "NvInfer.h"
+#include <cuda_runtime_api.h>
+#include <string>
 #include <vector>
 #include <iostream>
 #include <cstring>
@@ -7,12 +9,17 @@
 using namespace nvinfer1;
 
 // [수정 1] extern "C" 제거 -> C++ 링킹 사용
+// mask는 Eq.(19)의 soft mask 융합용(Listing 2) — 이 플러그인은 4-input
+// (input, bit_map, min, max) 계약을 유지하므로 nullptr로 호출하고,
+// m(p) 곱은 TensorRT 그래프의 elementwise 레이어로 적용한다.
 void launch_spatial_quantization(
-    const float* input, const float* bit_map, 
-    const float* min_vals, const float* max_vals, 
+    const float* input, const float* bit_map,
+    const float* min_vals, const float* max_vals,
+    const float* mask,
     float* output,
     int N, int C, int H, int W,
-    int tile_h, int tile_w, 
+    int tile_h, int tile_w,
+    int n_tiles_h, int n_tiles_w,
     cudaStream_t stream
 );
 
@@ -50,9 +57,14 @@ public:
         int H = dims.d[2];
         int W = dims.d[3];
 
+        // 실제 bit_map 그리드 크기 (input[1]: (N, H_tiles, W_tiles))
+        Dims mapDims = inputDesc[1].dims;
+        int nTilesH = mapDims.d[1];
+        int nTilesW = mapDims.d[2];
+
         launch_spatial_quantization(
-            inputData, bitMapData, minData, maxData, outputData,
-            N, C, H, W, mTileH, mTileW, stream
+            inputData, bitMapData, minData, maxData, /*mask=*/nullptr,
+            outputData, N, C, H, W, mTileH, mTileW, nTilesH, nTilesW, stream
         );
 
         return 0;
@@ -70,7 +82,16 @@ public:
     }
 
     void configurePlugin(const DynamicPluginTensorDesc* in, int nbInputs, const DynamicPluginTensorDesc* out, int nbOutputs) noexcept override {}
-    
+
+    // IPluginV2DynamicExt / IPluginV2의 순수 가상 함수 — 구현이 없으면
+    // 추상 클래스가 되어 인스턴스화(new MCAQPlugin) 자체가 컴파일되지 않는다.
+    int getNbOutputs() const noexcept override { return 1; }
+
+    size_t getWorkspaceSize(const PluginTensorDesc* inputs, int nbInputs,
+                            const PluginTensorDesc* outputs, int nbOutputs) const noexcept override {
+        return 0;  // 커널이 전부 in-place 산출 — 별도 workspace 불필요
+    }
+
     size_t getSerializationSize() const noexcept override { return sizeof(mTileH) + sizeof(mTileW); }
     
     void serialize(void* buffer) const noexcept override {

@@ -613,42 +613,46 @@ class SpatialAdaptiveQuantization(nn.Module):
         """Optimized CUDA forward pass for inference."""
         B, C, H, W = x.shape
         _, H_tiles, W_tiles = bit_map.shape # bit_map assumed (B, Ht, Wt)
-        
+
         tile_h = H // H_tiles
         tile_w = W // W_tiles
-        
+
         # Paper Sec IV-D: after calibration the EMA statistics are frozen and
         # reused at inference; dynamic per-batch min/max is the fallback when
         # no calibration has been performed.
         if bool(self.stats_frozen) and self.running_min is not None:
-            x_min = self.running_min.view(1, -1, 1, 1)
-            x_max = self.running_max.view(1, -1, 1, 1)
+            x_min = self.running_min.reshape(1, -1, 1, 1)
+            x_max = self.running_max.reshape(1, -1, 1, 1)
         elif self.per_channel:
              # Calculate per-channel min/max over (Batch, Height, Width) for consistent scaling per channel
              # Note: Kernel expects (1, C, 1, 1) layout
              x_min = x.amin(dim=(0, 2, 3), keepdim=True)
              x_max = x.amax(dim=(0, 2, 3), keepdim=True)
         else:
-             x_min = x.min().view(1, 1, 1, 1)
-             x_max = x.max().view(1, 1, 1, 1)
+             x_min = x.min().reshape(1, 1, 1, 1)
+             x_max = x.max().reshape(1, 1, 1, 1)
 
-        # Ensure contiguous memory for CUDA
-        out = mcaq_cuda_ops.spatial_quantize(
+        # The kernel indexes min_vals[c]/max_vals[c] per channel — broadcast
+        # per-tensor (or scalar frozen) statistics to C entries so a
+        # per_channel=False configuration cannot read out of bounds.
+        if x_min.numel() != C:
+            x_min = x_min.expand(1, C, 1, 1)
+            x_max = x_max.expand(1, C, 1, 1)
+
+        # Eq.(19) learned soft mask m(p) — handed to the kernel, which fuses
+        # the multiply with quantization (paper Listing 2).
+        m = None
+        if self.smooth_transitions and self.soft_mask is not None:
+            m = self.soft_mask(bit_map, x).float().contiguous()
+
+        return mcaq_cuda_ops.spatial_quantize(
             x.contiguous(),
             bit_map.float().contiguous(),
-            x_min.contiguous(),
-            x_max.contiguous(),
-            tile_h, tile_w
+            x_min.float().contiguous(),
+            x_max.float().contiguous(),
+            tile_h, tile_w,
+            m,
         )
-
-        # Eq.(19): apply the learned soft mask m(p) (the fused kernel in the
-        # paper's Listing 2 folds this multiply into the kernel; here it is an
-        # equivalent elementwise post-multiply)
-        if self.smooth_transitions and self.soft_mask is not None:
-            m = self.soft_mask(bit_map, x)
-            out = out * m
-
-        return out
 
     def _forward_pytorch(self, x: torch.Tensor, bit_map: torch.Tensor, training: bool) -> torch.Tensor:
         """Original PyTorch forward pass (slow, but differentiable)."""
