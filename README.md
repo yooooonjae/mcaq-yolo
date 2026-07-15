@@ -180,7 +180,6 @@ from mcaq_yolo.core.morphology import MorphologicalComplexityAnalyzer
 
 analyzer = MorphologicalComplexityAnalyzer(
     grid_size=8,           # tiles per spatial dimension (8x8 grid)
-    cache_size=10000,
     device='cuda',
     metric_backend='gpu',  # 'gpu' (vectorized, training) | 'cv2' (exact, offline)
 )
@@ -293,7 +292,7 @@ Contributions are welcome — please open an issue or a pull request.
 
 ## 📄 License
 
-This project is licensed under the MIT License.
+This project is licensed under the MIT License — see [LICENSE](LICENSE).
 
 ## 🙏 Acknowledgments
 
@@ -347,3 +346,43 @@ with v0.1.x are not directly comparable** where noted.
   `--legacy` to reproduce the pre-fix gap). After training, call
   `model.complexity_analyzer.fit_feature_weights(loader)` to refit Eq.8's
   α to the trained MLP before recomputing curriculum scores.
+
+## v0.2.1 — External review fixes (2026-07)
+
+- **Best-checkpoint selection (behavior change, was broken).** `best.pt` was
+  chosen by minimum `val_loss` across quantization regimes, so the
+  un-quantized Stage-1 warm-up loss pinned `best.pt` to an FP checkpoint for
+  the rest of training. Best is now the highest **quantized mAP@0.5 from
+  Stage 3 onward** (the AP implementation in `utils/evaluation.py` is wired
+  into the training loop); `last.pt` is saved every epoch, and runs that end
+  before Stage 3 fall back to the final model with an explicit notice.
+- **LICENSE added** (MIT — the README previously claimed MIT without a
+  license file, which meant no license was actually granted).
+- **CUDA kernel status made explicit.** The kernel has never been compiled or
+  executed by the authorsʼ CPU-only environment; a kernel-vs-PyTorch parity
+  test now exists (`test_cuda_kernel_parity`) and runs automatically on
+  machines with CUDA + the built extension. Until someone runs it on a GPU,
+  treat the kernel as inspection-verified only.
+- **Dead code removed / isolated.** The never-used tile cache (paper Table X
+  claims a 10k-entry cache — **not implemented**, now stated as a documented
+  deviation), `ComplexityBasedSampler`, `ProgressiveQuantizationScheduler`,
+  `AdaptiveLearningRateScheduler` and the write-only curriculum history lists
+  are gone. `LearnedRoundingQuantization` (α untrainable in the current
+  pipeline) and MSE calibration (offline-only cost) are documented as
+  experimental. Entropy calibration now uses `torch.histc` (the previous
+  `torch.histogram` is CPU-only and crashed on CUDA tensors).
+- **Feature-domain complexity documented.** Morphological metrics run on the
+  channel-mean of the C3/C4/C5 feature maps every forward — a different
+  operator from the paper's image-domain, calibration-time analysis; this
+  repo does not reproduce the paper's 0.3 ms / 151 FPS latency path
+  (stated in the hook and here).
+- **Hygiene.** `Trainer` builds `MCAQYOLO` with an explicit constructor call
+  (no more `inspect.signature` probing); migrated to `torch.amp` (AMP now
+  auto-disables off-CUDA — the old CPU `amp: false` advice is automatic);
+  `MCQLYOLOLoss` typo renamed to `MCAQYOLOLoss` (old name kept as an alias);
+  import-time prints are `warnings.warn`; internal review-artifact comment
+  references reworded to be self-contained; line endings normalized.
+- **Reproducibility status (unchanged, stated plainly):** no trained
+  weights, no paper-table configs/results are distributed yet, and
+  dependencies are lower-bounded only. Verified environment for the test
+  suite and smoke runs: Python 3.13, torch 2.12, ultralytics 8.4.63 (CPU).

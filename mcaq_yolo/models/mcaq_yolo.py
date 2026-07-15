@@ -56,9 +56,12 @@ def kd_logit_loss(student_outputs, teacher_outputs) -> Optional[torch.Tensor]:
     return sum(losses) / len(losses)
 
 
-class MCQLYOLOLoss(nn.Module):
+class MCAQYOLOLoss(nn.Module):
     """
     Combined loss function for MCAQ-YOLO with proper YOLO detection loss.
+
+    (REVIEW FIX: renamed from the original typo `MCQLYOLOLoss`; the old name
+    is kept as a module-level alias for backward compatibility.)
     """
     
     def __init__(
@@ -208,8 +211,12 @@ class MCQLYOLOLoss(nn.Module):
         )
         
         loss_dict['loss_total'] = total_loss
-        
+
         return total_loss, loss_dict
+
+
+# Backward-compatibility alias for the original (typo'd) class name
+MCQLYOLOLoss = MCAQYOLOLoss
 
 
 class MCAQYOLO(nn.Module):
@@ -268,11 +275,11 @@ class MCAQYOLO(nn.Module):
         # Use object.__setattr__ to bypass nn.Module's attribute registration
         object.__setattr__(self, '_yolo_wrapper', _yolo_wrapper)
         
-        # Initialize components (paper Sec IV-D: default 8x8 tile grid;
-        # Table X: cache size 10,000)
+        # Initialize components (paper Sec IV-D: default 8x8 tile grid).
+        # NOTE (documented deviation): the paper's Table X tile cache is not
+        # implemented — see MorphologicalComplexityAnalyzer.__init__.
         self.complexity_analyzer = MorphologicalComplexityAnalyzer(
             grid_size=grid_size,
-            cache_size=10000,
             device=device
         )
         
@@ -300,13 +307,13 @@ class MCAQYOLO(nn.Module):
         # Paper Sec IV-D / Table X: per-channel min/max calibration with EMA 0.99.
         # NOTE: one quantizer PER backbone scale — P3/P4/P5 have different channel
         # counts, so sharing a single per-channel EMA buffer across scales would
-        # produce a shape mismatch on the second hook (Codex final review).
+        # produce a shape mismatch on the second hook.
         # The ModuleDict is populated in _register_mcaq_hooks() once the backbone
         # output indices are known.
         self.quantizers = nn.ModuleDict()
         
         # Initialize loss function with model
-        self.loss_fn = MCQLYOLOLoss(
+        self.loss_fn = MCAQYOLOLoss(
             model=self.model,
             target_bits=target_bits,
             lambda_bit=0.01,    # Paper Table X: lambda1 (annealed 0.01 -> 0.1 via curriculum)
@@ -346,7 +353,7 @@ class MCAQYOLO(nn.Module):
         Locate the indices of the backbone layers whose outputs (P3/P4/P5 —
         the C3/C4/C5 feature maps) feed the FPN neck.
 
-        Primary logic (dynamic, per Codex review): the backbone ends at SPPF;
+        Primary logic (dynamic): the backbone ends at SPPF;
         every neck layer's `.f` (from-index) that points back into the backbone
         identifies a skip connection (P3/P4). P5 is the SPPF output itself.
         Fallback: [4, 6, 9] (standard YOLOv8 n/s/m/l/x topology).
@@ -375,8 +382,8 @@ class MCAQYOLO(nn.Module):
                 for j in f_list:
                     # strictly BELOW SPPF: the neck's P5-route Concat references
                     # the SPPF index itself (f=[-1, sppf]), which must not be
-                    # double-counted (workflow finding [8]: '<=' yielded
-                    # [4,6,9,9] and two hooks on layer 9)
+                    # double-counted (a '<=' comparison here yielded [4,6,9,9]
+                    # and two hooks on layer 9)
                     if isinstance(j, int) and j != -1 and 0 <= j < sppf_idx:
                         refs.add(j)
 
@@ -407,7 +414,15 @@ class MCAQYOLO(nn.Module):
                 return None
 
             feat = output
-            # Complexity (phi: no_grad side-info; MLP learnable — Algorithm 1)
+            # Complexity (phi: no_grad side-info; MLP learnable — Algorithm 1).
+            # IMPLEMENTATION ASSUMPTION (review point): the morphological
+            # metrics run on the channel-mean of the C3/C4/C5 FEATURE map, not
+            # on the input image — the paper describes image-domain morphology
+            # at calibration time (0.3ms overhead), whereas this per-forward
+            # feature-domain computation is a different operator and does not
+            # reproduce the paper's latency path. Feature-vs-image complexity
+            # correlation has not been measured here; treat per-scale
+            # complexity maps as feature-domain quantities.
             complexity = self.complexity_analyzer(feat)
             if self.normalize_complexity:
                 B = complexity.shape[0]

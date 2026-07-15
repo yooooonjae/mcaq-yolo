@@ -12,7 +12,6 @@ import torch.nn.functional as F
 from scipy.stats import entropy
 from skimage.feature import local_binary_pattern
 from typing import Optional, Tuple
-import hashlib
 
 
 class MorphologicalComplexityAnalyzer(nn.Module):
@@ -30,7 +29,6 @@ class MorphologicalComplexityAnalyzer(nn.Module):
     def __init__(
         self,
         grid_size: int = 8,        # Paper Sec IV-D: tile size defaults to H/8 (8x8 grid)
-        cache_size: int = 10000,   # Paper Table X: cache size 10,000 entries
         device: str = "cuda",
         metric_backend: str = "gpu",  # 'gpu' (vectorized surrogates) | 'cv2' (exact Eq.21-24)
         canny_impl: str = "cv2compat",    # 'cv2compat' (default) | 'legacy'
@@ -43,7 +41,6 @@ class MorphologicalComplexityAnalyzer(nn.Module):
         Args:
             grid_size: Number of tiles per spatial dimension (paper default 8x8 grid;
                        finer 16x16 grids may be used for high object density, Eq.12)
-            cache_size: Maximum number of cached complexity values
             device: Device to run computations on
             metric_backend:
                 'cv2' — exact per-tile metrics via OpenCV (Canny+Otsu edge maps,
@@ -66,14 +63,17 @@ class MorphologicalComplexityAnalyzer(nn.Module):
         self.canny_impl = canny_impl
         self.binarize_impl = binarize_impl
         self.contour_components = contour_components
-        self.cache = {}
-        self.cache_size = cache_size
+        # DOCUMENTED DEVIATION (review fix — removed a dead cache): the paper's
+        # Table X specifies a 10,000-entry tile-complexity cache; this
+        # implementation does NOT implement it (a cache dict existed here but
+        # was never read or written, which misleadingly implied the feature).
+        # The vectorized GPU path recomputes per batch instead.
 
         # Algorithm 1 line 14-15: phi = [phi1..phi5, phi1*phi2, phi3^2, phi4*phi5]; C <- MLP(phi)
         # The 8-D feature already carries the Eq.(9) interaction terms (beta12, beta33, beta45
         # are absorbed as learnable weights of this MLP) — do NOT add a separate interaction
         # module on top, that would double-count Eq.(9).
-        # LayerNorm instead of BatchNorm (Codex review #5): after
+        # LayerNorm instead of BatchNorm: after
         # phi.reshape(-1, 8) a BatchNorm would share statistics across the
         # mixed tile/image/scale batch, which at small training scales
         # compresses the C range globally (measured: C in [0.009, 0.026]).
@@ -306,11 +306,6 @@ class MorphologicalComplexityAnalyzer(nn.Module):
         # phi1 (Df/2) and phi2 (Ht/Hmax) but leaves phi5's unspecified.
         return 1.0 - 1.0 / ic_mean
 
-    def get_tile_hash(self, tile: torch.Tensor) -> str:
-        """Generate hash for tile caching."""
-        tile_np = tile.detach().cpu().numpy()
-        return hashlib.md5(tile_np.tobytes()).hexdigest()
-
     def bilateral_filter(
         self,
         complexity_map: torch.Tensor,
@@ -367,9 +362,9 @@ class MorphologicalComplexityAnalyzer(nn.Module):
 
         Power-of-two tiles are required so the dyadic box-counting scales
         (Algorithm 2) divide the tile exactly — non-power-of-two tiles produce
-        mismatched per-scale grids (workflow finding [4]) — and match
-        Algorithm 1 line 1's s in {16, 32, 64}. The floor of 4 guarantees at
-        least two dyadic scales for the fractal regression (finding [5]).
+        mismatched per-scale grids — and match Algorithm 1 line 1's
+        s in {16, 32, 64}. The floor of 4 guarantees at least two dyadic
+        scales for the fractal regression.
 
         DOCUMENTED DEVIATION: the paper's tile-size statements conflict —
         Sec IV-D/Eq.12 say "H/8 (8x8 grid)" while Algorithm 1 requires
@@ -824,7 +819,7 @@ class MorphologicalComplexityAnalyzer(nn.Module):
         # support fp16 on CUDA. Force full precision for the metric pipeline
         # (deterministic side-information; precision matters more than speed).
         if features.is_cuda:
-            with torch.cuda.amp.autocast(enabled=False):
+            with torch.amp.autocast("cuda", enabled=False):
                 return self._phi_tiles_gpu(features.float())
         return self._phi_tiles_gpu(features.float())
 

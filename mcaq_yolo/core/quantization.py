@@ -10,13 +10,17 @@ import numpy as np
 from typing import Optional, Tuple, Dict, List
 import warnings
 
-# CUDA Extension 로드 시도
+# CUDA Extension 로드 시도 (REVIEW FIX: import 시점 print 부작용 → warnings.warn)
 try:
     import mcaq_cuda_ops
     HAS_CUDA = True
 except ImportError:
     HAS_CUDA = False
-    print("[MCAQ-YOLO] Warning: 'mcaq_cuda_ops' not found. Falling back to slow PyTorch implementation.")
+    warnings.warn(
+        "[MCAQ-YOLO] 'mcaq_cuda_ops' not found — falling back to the slow "
+        "PyTorch implementation.",
+        RuntimeWarning,
+    )
 
 
 class QuantizationParameters:
@@ -115,7 +119,15 @@ class StraightThroughEstimator(torch.autograd.Function):
 
 
 class LearnedRoundingQuantization(nn.Module):
-    """Learned rounding for better quantization."""
+    """Learned rounding for better quantization.
+
+    EXPERIMENTAL / INFERENCE-ONLY (review finding): this module is applied
+    only on the non-training branch of quantize_tensor, so its alpha
+    parameter never receives a gradient in the current pipeline — it stays
+    at initialization (sigmoid(0)=0.5, i.e. plain 0.5-interpolated rounding).
+    Wiring it into training (AdaRound-style) is future work; do not expect
+    learned behavior from enabling it today.
+    """
     
     def __init__(self, num_channels: Optional[int] = None):
         """
@@ -182,7 +194,8 @@ class LearnedSoftMask(nn.Module):
         # (softmax ~= 0.982 ~ identity) while the gradient path through
         # W2^T @ grad stays alive from the very first backward pass — an
         # exactly-zero W2 would give net[0] a zero gradient on step 1
-        # (final verification finding). The first conv keeps its default init.
+        # (an exactly-zero W2 would block all learning at step 1).
+        # The first conv keeps its default init.
         nn.init.normal_(self.net[-1].weight, std=1e-3)
         with torch.no_grad():
             self.net[-1].bias.copy_(torch.tensor([4.0, 0.0]))
@@ -342,15 +355,20 @@ class SpatialAdaptiveQuantization(nn.Module):
     def _update_calibration_histogram(self, x: torch.Tensor):
         """Update histogram for entropy-based calibration."""
         with torch.no_grad():
-            x_flat = x.flatten()
-            
-            # Compute histogram
-            hist, bin_edges = torch.histogram(
+            x_flat = x.detach().float().flatten()
+
+            # REVIEW FIX: torch.histogram is CPU-only — on CUDA tensors it
+            # raised at runtime whenever calibration_mode='entropy' was used
+            # on GPU. torch.histc supports CUDA; normalize to a density-like
+            # distribution manually.
+            hist = torch.histc(
                 x_flat,
                 bins=self.histogram_bins,
-                density=True
+                min=float(x_flat.min()),
+                max=float(x_flat.max()),
             )
-            
+            hist = hist / hist.sum().clamp(min=1.0)
+
             if self.calibration_histogram is None:
                 self.calibration_histogram = hist
             else:
@@ -501,7 +519,13 @@ class SpatialAdaptiveQuantization(nn.Module):
         bits: int,
         num_candidates: int = 100
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """MSE-optimal calibration."""
+        """MSE-optimal calibration.
+
+        OFFLINE USE ONLY (review finding): runs a 100-candidate grid search
+        with a full quantize/dequantize per candidate on EVERY call — far too
+        expensive for a per-forward path. Use for offline calibration sweeps;
+        prefer 'minmax' (default) or 'percentile' at runtime.
+        """
         # Search for scale that minimizes reconstruction error
         x_min = x.min()
         x_max = x.max()

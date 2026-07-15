@@ -52,7 +52,7 @@ ext_modules, cmdclass = _cuda_extension()
 
 setup(
     name="mcaq-yolo",
-    version="0.2.0",
+    version="0.2.1",
     author="Yoonjae Seo",
     author_email="ssyyjj0517@naver.com",
     description="Morphological Complexity-Aware Quantization for YOLO",

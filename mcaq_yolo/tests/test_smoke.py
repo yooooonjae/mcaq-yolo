@@ -1,13 +1,12 @@
 """
-Smoke tests for MCAQ-YOLO — run these FIRST on a machine with torch installed
-(they were authored in an environment without torch, so nothing here has been
-executed yet):
+Smoke tests for MCAQ-YOLO.
 
-    cd /path/to/yolo            # parent of mcaq_yolo/
+    cd /path/to/repo-root       # parent of mcaq_yolo/
     python -m pytest mcaq_yolo/tests/test_smoke.py -v
 
-CPU-friendly: no GPU, no ultralytics weights needed except for the final
-(optional) end-to-end test, which is skipped unless ultralytics is available.
+CPU-friendly: no GPU or ultralytics weights needed except for the end-to-end
+test (skipped unless ultralytics is available) and the CUDA kernel parity
+test (skipped unless CUDA and the built mcaq_cuda_ops extension are present).
 """
 
 import math
@@ -158,11 +157,11 @@ def test_curriculum_schedule():
     w = cs.get_loss_weights(0)
     assert math.isclose(w['bit_budget'], 0.01, rel_tol=1e-6)
     # Smoothness ramps: 0 during warm-up (quantization bypassed), full lambda2
-    # from the end of the transition stage (Codex review #4)
+    # from the end of the transition stage
     assert w['smoothness'] == 0.0
     assert math.isclose(cs.get_loss_weights(50)['smoothness'], 0.1, rel_tol=1e-6)
     assert math.isclose(w['distillation'], 0.5, rel_tol=1e-6)
-    # Bit-target schedule (Codex review #1): 8 during warm-up, ~4 by the end
+    # Bit-target schedule: 8 during warm-up, ~4 by the end
     assert math.isclose(cs.get_target_bits(0), 8.0, rel_tol=1e-6)
     assert cs.get_target_bits(300) < 4.5
 
@@ -222,3 +221,26 @@ def test_contour_euler_component_count():
     assert float(M._euler_components_tiles(m, 16)) == 1.0
     m[0, 0, 10:14, 10:14] = 1
     assert float(M._euler_components_tiles(m, 16)) == 2.0
+
+
+def test_cuda_kernel_parity():
+    """CUDA kernel vs PyTorch fallback numerical parity (REVIEW FIX: the
+    kernel had never been executed against the reference path). Runs only
+    where CUDA and the built mcaq_cuda_ops extension are available — on CPU
+    machines it skips, and the kernel remains inspection-verified only."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    pytest.importorskip("mcaq_cuda_ops")
+    from mcaq_yolo.core.quantization import SpatialAdaptiveQuantization
+
+    torch.manual_seed(0)
+    for smooth in (False, True):
+        q = SpatialAdaptiveQuantization(smooth_transitions=smooth).cuda().eval()
+        x = torch.randn(2, 8, 32, 32, device="cuda")
+        bit_map = torch.randint(2, 9, (2, 4, 4), device="cuda").float()
+        out_cuda = q._forward_cuda(x, bit_map)
+        out_ref = q._forward_pytorch(x, bit_map, training=False)
+        assert torch.allclose(out_cuda, out_ref, atol=1e-4), (
+            f"kernel/PyTorch divergence (smooth_transitions={smooth}): "
+            f"max |delta| = {(out_cuda - out_ref).abs().max().item():.3e}"
+        )

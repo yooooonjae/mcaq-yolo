@@ -1,7 +1,7 @@
 """
 Evaluation utilities for MCAQ-YOLO
 
-Rewritten for correctness (judge-panel findings):
+Rewritten for correctness:
 - AP is now a real average precision (score-sorted greedy matching, per-class,
   all-point interpolation) — the previous "precision * recall" was not AP.
 - Predictions are decoded with the official Ultralytics NMS before matching;

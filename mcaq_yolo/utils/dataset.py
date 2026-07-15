@@ -314,7 +314,7 @@ def compute_dataset_complexity(
 
     # 반드시 batch_size=1: _collate_fn이 batch_list[0]만 반환하므로 batch_size>1이면
     # 배치당 1개 score만 계산되어 dataset 인덱스와 score 배열이 어긋난다
-    # (커리큘럼 필터링 Dt={C(x)<=tau_t}가 깨짐 — Codex final review).
+    # (커리큘럼 필터링 Dt={C(x)<=tau_t}가 깨진다).
     # 함수 인자의 batch_size는 호환성을 위해 받지만 여기서는 사용하지 않는다.
     def _collate_fn(batch_list):
         return batch_list[0]

@@ -46,20 +46,27 @@ def profile_model(model: nn.Module, input_shape: tuple, device: str = 'cuda') ->
     # Dummy input
     x = torch.randn(1, *input_shape).to(device)
     
+    # REVIEW FIX: unconditional torch.cuda.synchronize() crashed on CPU/MPS
+    use_cuda_sync = str(device).startswith("cuda") and torch.cuda.is_available()
+
+    def _sync():
+        if use_cuda_sync:
+            torch.cuda.synchronize()
+
     # Warmup
     for _ in range(10):
         with torch.no_grad():
             _ = model(x)
-    
+
     # Time inference
-    torch.cuda.synchronize()
+    _sync()
     start = time.time()
-    
+
     with torch.no_grad():
         for _ in range(100):
             _ = model(x)
-    
-    torch.cuda.synchronize()
+
+    _sync()
     end = time.time()
     
     avg_time = (end - start) / 100 * 1000  # ms
@@ -89,8 +96,9 @@ def apply_weight_quantization(
                     
                     min_vals = weight.min(dim=1, keepdim=True)[0]
                     max_vals = weight.max(dim=1, keepdim=True)[0]
-                    
-                    scale = (max_vals - min_vals) / (2**bits - 1)
+
+                    # REVIEW FIX: constant-weight channels gave scale=0 -> NaN
+                    scale = ((max_vals - min_vals) / (2**bits - 1)).clamp(min=1e-12)
                     zero_point = -min_vals / scale
                     
                     weight_q = torch.round(weight / scale + zero_point)
@@ -102,8 +110,9 @@ def apply_weight_quantization(
                     # Per-tensor quantization
                     min_val = weight.min()
                     max_val = weight.max()
-                    
-                    scale = (max_val - min_val) / (2**bits - 1)
+
+                    # REVIEW FIX: constant weights gave scale=0 -> NaN
+                    scale = ((max_val - min_val) / (2**bits - 1)).clamp(min=1e-12)
                     zero_point = -min_val / scale
                     
                     weight_q = torch.round(weight / scale + zero_point)

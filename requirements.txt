@@ -1,3 +1,7 @@
+# Lower bounds only — the ultralytics API moves quickly (e.g. NMS relocated
+# in 8.4; the code handles both), so for bit-for-bit reproduction pin to the
+# VERIFIED environment the test suite and smoke runs were executed with:
+#   Python 3.13, torch 2.12, ultralytics 8.4.63, numpy 2.x, opencv 4.x (CPU)
 ultralytics>=8.0.0
 torch>=2.0.0
 torchvision>=0.15.0

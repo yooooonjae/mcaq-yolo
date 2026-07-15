@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import inspect
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, Any, Tuple, Optional
@@ -20,7 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader, SubsetRandomSampler
 from tqdm import tqdm
 
@@ -31,6 +30,7 @@ from ultralytics.cfg import DEFAULT_CFG
 from .models.mcaq_yolo import MCAQYOLO  # 네 레포의 MCAQ 모델
 from .core.curriculum import CurriculumScheduler
 from .utils.dataset import compute_dataset_complexity
+from .utils.evaluation import compute_map, extract_targets_per_image, _decode_outputs
 from .utils.repro import set_global_seed
 
 
@@ -64,7 +64,7 @@ class Trainer:
         # --------------------------
         # Paper Table X: total epochs = 300. (A default below warmup_epochs=20
         # would keep the curriculum in Stage 1 forever — quantization would
-        # never activate; workflow finding [9].)
+        # never activate.)
         self.epochs: int = int(config.get("epochs", 300))
         self.batch_size: int = int(config.get("batch_size", 128))
         self.output_dir = Path(config.get("output_dir", "outputs/default_run"))
@@ -95,73 +95,25 @@ class Trainer:
 
         # --------------------------
         # 학생(MCAQYOLO) 인스턴스 생성
-        #   → 실제 MCAQYOLO.__init__의 시그니처를 런타임에 읽어서
-        #     존재하는 인자만 골라 넘긴다.
+        # REVIEW FIX: 이전에는 inspect.signature로 MCAQYOLO의 인자를 런타임에
+        # 탐색했다 — 같은 저장소의 두 클래스 사이 인터페이스를 불투명하게
+        # 만드는 안티패턴. 명시적 생성자 호출로 교체 (시그니처가 바뀌면
+        # 여기서 TypeError로 즉시 드러나는 것이 올바른 실패 방식이다).
         # --------------------------
         quant_cfg = config.get("quantization", {})
-        curriculum_cfg = config.get("curriculum", {})
 
-        # MCAQYOLO.__init__ 시그니처 조사
-        init_sig = inspect.signature(MCAQYOLO)
-        param_names = list(init_sig.parameters.keys())[1:]  # self 제외
+        model_kwargs = dict(
+            model_name=model_cfg.get("name", "yolov8n"),
+            num_classes=num_classes,
+            device=str(self.device),
+        )
+        # Quantization settings (Table X 기본값은 MCAQYOLO 쪽 디폴트를 따른다)
+        for key in ("min_bits", "max_bits", "target_bits", "grid_size",
+                    "bit_mapping", "normalize_complexity"):
+            if key in quant_cfg:
+                model_kwargs[key] = quant_cfg[key]
 
-        kwargs = {}
-        # 자주 나오는 이름들을 대응
-        if "teacher_model" in param_names:
-            kwargs["teacher_model"] = self.teacher_model
-        if "backbone" in param_names or "base_model" in param_names or "yolo_model" in param_names:
-            # 여러 이름 중 하나만 쓰도록
-            if "backbone" in param_names:
-                kwargs["backbone"] = self.teacher_model
-            elif "base_model" in param_names:
-                kwargs["base_model"] = self.teacher_model
-            elif "yolo_model" in param_names:
-                kwargs["yolo_model"] = self.teacher_model
-
-        if "num_classes" in param_names or "nc" in param_names:
-            if "num_classes" in param_names:
-                kwargs["num_classes"] = num_classes
-            else:
-                kwargs["nc"] = num_classes
-
-        if "quant_cfg" in param_names or "quantization_cfg" in param_names:
-            if "quant_cfg" in param_names:
-                kwargs["quant_cfg"] = quant_cfg
-            else:
-                kwargs["quantization_cfg"] = quant_cfg
-
-        if "curriculum_cfg" in param_names or "curriculum" in param_names:
-            if "curriculum_cfg" in param_names:
-                kwargs["curriculum_cfg"] = curriculum_cfg
-            else:
-                kwargs["curriculum"] = curriculum_cfg
-
-        # Quantization / model settings 전달 (설정 재현성 — Table X 기본값 유지)
-        for key in ("min_bits", "max_bits", "target_bits", "grid_size", "bit_mapping", "normalize_complexity"):
-            if key in param_names and key in quant_cfg:
-                kwargs[key] = quant_cfg[key]
-        if "model_name" in param_names and model_cfg.get("name"):
-            kwargs["model_name"] = model_cfg["name"]
-        if "device" in param_names:
-            kwargs["device"] = str(self.device)
-
-        # 혹시 아무 매개변수도 매칭 안 되면, 인자 없이 한 번 시도
-        try:
-            if kwargs:
-                self.model = MCAQYOLO(**kwargs).to(self.device)
-            else:
-                self.model = MCAQYOLO().to(self.device)
-        except TypeError as e:
-            # 혹시라도 실패하면, 최소한 teacher_model만 positional로 넣어서 다시 시도
-            print(f"[MCAQ][WARN] MCAQYOLO init with kwargs failed: {e}")
-            try:
-                self.model = MCAQYOLO(self.teacher_model).to(self.device)
-            except Exception as e2:
-                raise RuntimeError(
-                    "MCAQYOLO 초기화에 실패했습니다. "
-                    "mcaq_yolo/models/mcaq_yolo.py 의 __init__ 시그니처를 확인해서 "
-                    "필요하면 Trainer 코드를 맞춰야 합니다."
-                ) from e2
+        self.model = MCAQYOLO(**model_kwargs).to(self.device)
 
         # --------------------------
         # Dataset / Dataloader
@@ -232,10 +184,13 @@ class Trainer:
             self.scheduler = None
 
         # --------------------------
-        # Mixed precision
+        # Mixed precision (torch.amp — torch.cuda.amp is deprecated).
+        # AMP는 CUDA에서만 활성화: CPU/MPS에서 config의 amp:true를 그대로 켜면
+        # 경고/미지원 경로로 빠진다 (REVIEW FIX — 자동 비활성화).
         # --------------------------
-        self.use_amp = bool(config.get("training", {}).get("amp", True))
-        self.scaler = GradScaler(enabled=self.use_amp)
+        self.use_amp = (bool(config.get("training", {}).get("amp", True))
+                        and self.device.type == "cuda")
+        self.scaler = GradScaler("cuda", enabled=self.use_amp)
 
         # distillation, curriculum 설정
         self.distill_cfg = config.get("distillation", {})
@@ -579,10 +534,9 @@ class Trainer:
         temp = self._get_curriculum_temperature(epoch)
         tau_t = self.curriculum.get_complexity_threshold(epoch)
         loss_weights = self.curriculum.get_loss_weights(epoch)  # lambda1(t) annealed
-        # Codex review #1 (faithful): the curriculum's 8->4 bit-target schedule
-        # existed but was never wired into Lbit — a fixed target of 4 from
-        # epoch 1 exerts maximal collapse pressure exactly when Ldet is absent
-        # (Stage 1 bypasses quantization).
+        # The curriculum's 8->4 bit-target schedule must be wired into Lbit —
+        # a fixed target of 4 from epoch 1 exerts maximal collapse pressure
+        # exactly when Ldet is absent (Stage 1 bypasses quantization).
         target_bits_t = float(self.curriculum.get_target_bits(epoch))
         # Stage 1: high-precision warm-up — quantization bypassed (FP16/AMP forward)
         quantize = stage >= 2
@@ -619,7 +573,7 @@ class Trainer:
                 imgs = imgs.float()
             self.optimizer.zero_grad(set_to_none=True)
 
-            with autocast(enabled=self.use_amp):
+            with autocast("cuda", enabled=self.use_amp):
                 # 학생 모델 forward (complexity + bit allocation 포함;
                 # Stage 1에서는 quantize=False로 고정밀 warm-up)
                 outputs, aux_info = self.model(imgs, temp, quantize=quantize)
@@ -630,7 +584,7 @@ class Trainer:
                 # FP32 even when AMP is on (paper: FP32 teacher).
                 teacher_out = None
                 if kd_enabled:
-                    with torch.no_grad(), autocast(enabled=False):
+                    with torch.no_grad(), autocast("cuda", enabled=False):
                         self._teacher_feats.clear()
                         teacher_out = self.teacher_module(imgs.float())
 
@@ -757,7 +711,7 @@ class Trainer:
 
         Args:
             quantize: 학습 단계와 동일한 양자화 상태로 평가 (Stage 1 warm-up
-                동안에는 False — 학습/검증 불일치 방지, workflow finding [12])
+                동안에는 False — 학습/검증 레짐 불일치 방지)
             temperature: REVIEW FIX — 기존에는 1.0으로 고정되어, 어닐링
                 중(Stage 2)에는 학습(alpha_t>1, 비트 상향 포화)과 검증이
                 서로 다른 양자화 레짐으로 돌았다("same regime" 주석과 모순;
@@ -767,6 +721,7 @@ class Trainer:
         self.model.eval()
         total_loss = 0.0
         n_batches = 0
+        all_dets, all_tgts = [], []
 
         for batch in self.val_loader:
             imgs = batch["img"].to(self.device, non_blocking=True)
@@ -776,7 +731,7 @@ class Trainer:
             elif imgs.dtype != torch.float32 and imgs.dtype != torch.float16:
                 imgs = imgs.float()
 
-            with autocast(enabled=self.use_amp):
+            with autocast("cuda", enabled=self.use_amp):
                 outputs, aux_info = self.model(imgs, temperature=temperature, quantize=quantize)
                 loss, loss_dict = self.model.loss_fn(
                     outputs,
@@ -789,8 +744,19 @@ class Trainer:
             total_loss += loss_det.detach().item()
             n_batches += 1
 
+            # REVIEW FIX: mAP@0.5도 함께 측정 — best checkpoint 선택이 val loss가
+            # 아니라 검출 성능 기준으로 이루어져야 한다 (utils.evaluation의 AP
+            # 구현을 학습 루프에 연결).
+            B, _, img_h, img_w = imgs.shape
+            dets = _decode_outputs(outputs)
+            tgts = extract_targets_per_image(batch, B, img_w, img_h)
+            for d, t in zip(dets, tgts):
+                all_dets.append(d.float().cpu())
+                all_tgts.append(t)
+
         avg_loss = total_loss / max(1, n_batches)
-        return {"val_loss": avg_loss}
+        map50 = compute_map(all_dets, all_tgts, iou_thresholds=[0.5])["mAP@0.5"]
+        return {"val_loss": avg_loss, "mAP50": map50}
 
     # ------------------------------------------------------------------
     # Public API
@@ -802,15 +768,17 @@ class Trainer:
         print(f"Starting training for {self.epochs} epochs...")
         print(f"Output directory: {self.output_dir}")
 
-        best_val = float("inf")
+        best_map = -1.0
         best_weights_path = self.output_dir / "best.pt"
+        last_weights_path = self.output_dir / "last.pt"
 
         for epoch in range(1, self.epochs + 1):
             train_metrics = self.train_epoch(epoch)
+            stage = self.curriculum.get_stage(epoch)
             # Validate under the same quantization regime as training
             # (Stage 1 warm-up: high precision)
             val_metrics = self.evaluate(
-                quantize=self.curriculum.get_stage(epoch) >= 2,
+                quantize=stage >= 2,
                 temperature=self._get_curriculum_temperature(epoch),
             )
 
@@ -818,16 +786,31 @@ class Trainer:
                 self.scheduler.step()
 
             print(
-                f"Epoch {epoch}/{self.epochs} "
+                f"Epoch {epoch}/{self.epochs} [S{stage}] "
                 f"- loss: {train_metrics['loss']:.4f}, "
-                f"val_loss: {val_metrics['val_loss']:.4f}"
+                f"val_loss: {val_metrics['val_loss']:.4f}, "
+                f"mAP@0.5: {val_metrics['mAP50']:.4f}"
             )
 
-            if val_metrics["val_loss"] < best_val:
-                best_val = val_metrics["val_loss"]
+            torch.save(self.model.state_dict(), last_weights_path)
+
+            # REVIEW FIX (best-checkpoint selection): 이전에는 레짐 불문 최소
+            # val_loss로 best.pt를 골랐다 — Stage 1(비양자화 warm-up)의 loss가
+            # 구조적으로 낮아, Stage 2 진입 후 양자화 loss가 그 아래로 내려오지
+            # 않는 한 best.pt가 FP warm-up 체크포인트에 영원히 고정된다.
+            # 이제 best는 '양자화가 완전한 Stage 3'의 mAP@0.5 최고점으로 선택
+            # (검출 모델의 best는 loss가 아니라 AP 기준이 맞다).
+            if stage >= 3 and val_metrics["mAP50"] > best_map:
+                best_map = val_metrics["mAP50"]
                 torch.save(self.model.state_dict(), best_weights_path)
 
-        print(f"[MCAQ] Training finished. Best val_loss={best_val:.4f}")
+        if best_map < 0:
+            # 짧은 실행(Stage 3 미도달): 마지막 상태를 best로 저장하되 명시적으로 알림
+            torch.save(self.model.state_dict(), best_weights_path)
+            print("[MCAQ] Run ended before Stage 3 — best.pt is the FINAL model "
+                  "(no quantized-regime mAP selection happened).")
+        else:
+            print(f"[MCAQ] Training finished. Best quantized mAP@0.5={best_map:.4f}")
         print(f"[MCAQ] Best weights saved to {best_weights_path}")
 
         return self.model

@@ -2,7 +2,7 @@
 MCAQ-YOLO: Morphological Complexity-Aware Quantization for YOLO
 """
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 __author__ = "MCAQ-YOLO Team"
 
 # REVIEW FIX (packaging): the previous eager `from .models.mcaq_yolo import
@@ -20,7 +20,8 @@ from .core.curriculum import CurriculumScheduler
 
 _LAZY = {
     "MCAQYOLO": ".models.mcaq_yolo",
-    "MCQLYOLOLoss": ".models.mcaq_yolo",
+    "MCAQYOLOLoss": ".models.mcaq_yolo",
+    "MCQLYOLOLoss": ".models.mcaq_yolo",  # legacy alias (original typo'd name)
     "Trainer": ".train",
     "Predictor": ".inference",
 }
@@ -43,6 +44,7 @@ def __dir__():
 
 __all__ = [
     "MCAQYOLO",
+    "MCAQYOLOLoss",
     "MCQLYOLOLoss",
     "Trainer",
     "Predictor",

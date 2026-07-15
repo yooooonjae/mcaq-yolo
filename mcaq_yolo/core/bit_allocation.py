@@ -268,7 +268,7 @@ class ComplexityToBitMappingNetwork(nn.Module):
         # Straight-through clamp: with alpha_t in [1,10] most tiles saturate at
         # bmax for much of training, and a hard clamp would zero the gradient to
         # the mapping network exactly when Lbit needs to pull the average down.
-        # Forward = clamped value, backward = identity (workflow finding [6]).
+        # Forward = clamped value, backward = identity.
         clamped = torch.clamp(bit_map, self.min_bits, self.max_bits)
         bit_map = bit_map + (clamped - bit_map).detach()
 
