@@ -8,21 +8,18 @@ Official implementation of **MCAQ-YOLO: Morphological Complexity-Aware Quantizat
 
 ## 📋 Overview
 
-MCAQ-YOLO introduces a novel spatial quantization framework for object detection that dynamically allocates bit precision based on morphological complexity. By analyzing local visual characteristics through five complementary metrics (fractal dimension, texture entropy, gradient variance, edge density, and contour complexity), the framework achieves superior detection accuracy with aggressive compression ratios.
+MCAQ-YOLO introduces a spatial quantization framework for object detection that dynamically allocates bit precision based on morphological complexity. By analyzing local visual characteristics through five complementary metrics (fractal dimension, texture entropy, gradient variance, edge density, and contour complexity), the framework allocates higher precision to complex regions and aggressive compression to simple ones.
 
 ### Key Features
 
-- **Morphological Complexity Analysis**: Multi-metric assessment of spatial regions for informed bit allocation
-- **Curriculum Learning**: Progressive training strategy for stable optimization
-- **Spatial Adaptive Quantization**: Tile-wise mixed-precision with smooth transitions
-- **Hardware-Aware Design**: Optimized for modern accelerators with kernel fusion
+- **Morphological Complexity Analysis**: Five tile-wise metrics fused by a learnable MLP (exact OpenCV path for offline scoring, vectorized GPU surrogates for training)
+- **Complexity-to-Bit Mapping**: Learnable monotonic MLP (paper Eq.13-17) or a parameter-free linear mapper (the paper's ablation baseline)
+- **Spatial Adaptive Quantization**: Tile-wise mixed precision (2-8 bits) applied to the backbone C3/C4/C5 feature maps via forward hooks, with a learned spatially-smoothed soft mask (Eq.19)
+- **Curriculum Learning**: 3-stage schedule (high-precision warm-up → transition → full MCAQ) with temperature annealing and complexity-ordered data sampling
+- **Knowledge Distillation**: Logit-level and feature-level matching against an FP32 teacher
+- **Hardware-Aware Design**: Custom CUDA kernel for inference (with an automatic pure-PyTorch fallback) and a TensorRT plugin reference
 
-### Performance Highlights
-
-- **3.5% mAP improvement** over uniform 4-bit quantization
-- **7.6× model compression** with minimal accuracy loss
-- **40% faster convergence** with curriculum learning
-- **Strong correlation** (ρ=0.89) between complexity and quantization sensitivity
+For experimental results, see the paper (arXiv:2511.12976).
 
 ## 🚀 Quick Start
 
@@ -36,46 +33,59 @@ cd mcaq-yolo
 python -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
 
-# Install package
+# Install package (builds the CUDA kernel — requires torch + CUDA toolkit/nvcc)
 pip install -e .
+```
+
+**CPU-only machines** (no CUDA toolkit): `pip install -e .` will fail while
+building the CUDA extension. Install the dependencies and use the package
+from the repo root instead — quantization automatically falls back to the
+(slower) pure-PyTorch implementation:
+
+```bash
+pip install -r requirements.txt
+python -m mcaq_yolo.train --config configs/train_config.yaml --device cpu
 ```
 
 ### Training
 ```bash
-# Train with default configuration
+# Train with a configuration file (see "Training Configuration" below)
 mcaq-yolo-train --config configs/train_config.yaml
 
-# Train with custom settings
+# Override device / output directory from the CLI
 mcaq-yolo-train \
     --config configs/train_config.yaml \
     --device cuda:0 \
     --output-dir outputs/experiment_1
-
-# Resume from checkpoint
-mcaq-yolo-train \
-    --config configs/train_config.yaml \
-    --resume outputs/experiment_1/latest.pth
 ```
+
+The best weights (lowest validation loss) are saved to `<output_dir>/best.pt`.
 
 ### Inference
 ```bash
 # Single image inference
 mcaq-yolo-infer \
-    --model outputs/best.pth \
+    --model outputs/best.pt \
     --source image.jpg \
     --visualize
 
-# Batch inference on directory
+# Batch inference on a directory
 mcaq-yolo-infer \
-    --model outputs/best.pth \
+    --model outputs/best.pt \
     --source /path/to/images \
     --save-dir results
+```
+
+### Tests
+```bash
+# From the repo root (CPU-friendly smoke tests)
+python -m pytest mcaq_yolo/tests/test_smoke.py -v
 ```
 
 ## 📊 Model Architecture
 ```
 MCAQ-YOLO
-├── YOLOv8 Backbone
+├── YOLOv8 Backbone (quantization hooks on the C3/C4/C5 outputs)
 ├── Morphological Complexity Analyzer
 │   ├── Fractal Dimension
 │   ├── Texture Entropy (LBP)
@@ -83,25 +93,28 @@ MCAQ-YOLO
 │   ├── Edge Density
 │   └── Contour Complexity
 ├── Complexity-to-Bit Mapping Network
-│   └── Learnable monotonic mapping
+│   └── Learnable monotonic mapping (or linear ablation)
 └── Spatial Adaptive Quantization
-    └── Tile-wise mixed precision
+    └── Tile-wise mixed precision + learned soft mask
 ```
 
 ## 🎯 Training Configuration
 
-Create a configuration file `configs/train_config.yaml`:
+Example `configs/train_config.yaml` (every key below is consumed by the
+`Trainer`; the dataset itself is described by a standard YOLOv8 dataset yaml):
+
 ```yaml
 # Model configuration
 model:
   name: yolov8n
-  pretrained: true
-  teacher_path: yolov8n.pt
+  teacher_path: yolov8n.pt   # FP32 teacher for knowledge distillation
+  num_classes: 80
 
-# Dataset configuration
+# Dataset configuration (YOLOv8 format)
 data:
-  train_path: /path/to/train
-  val_path: /path/to/val
+  yaml_path: /path/to/dataset.yaml  # standard YOLOv8 yaml (path/train/val/names)
+  train: images/train               # relative to the dataset root
+  val: images/val
   img_size: 640
   num_workers: 8
 
@@ -115,129 +128,151 @@ quantization:
   min_bits: 2
   max_bits: 8
   target_bits: 4.0
+  grid_size: 8          # tiles per spatial dimension
+  bit_mapping: mlp      # 'mlp' (Eq.13-17) | 'linear' (paper's ablation)
+  normalize_complexity: false
 
-# Curriculum learning
+# Curriculum learning (3-stage schedule)
 curriculum:
   enabled: true
-  warmup_epochs: 30
+  warmup_epochs: 20     # Stage 1 boundary (Twarm)
+  transition_epochs: 50 # Stage 2 boundary
   initial_complexity: 0.2
   initial_temperature: 10.0
-  type: exponential
+  lambda_smooth: 0.1
+
+# Knowledge distillation
+distillation:
+  enabled: true
 
 # Optimizer
 optimizer:
-  type: adamw
+  type: adamw           # 'adamw' | anything else falls back to Adam
   weight_decay: 0.05
+  betas: [0.9, 0.999]
 
 # Learning rate scheduler
 scheduler:
-  type: cosine
-
-# Loss weights
-loss:
-  lambda_bit: 0.01
-  lambda_smooth: 0.001
-  lambda_kd: 0.5
-  lambda_reg: 0.0001
+  type: cosine          # cosine annealing with linear LR warmup
+  warmup_epochs: 5
+  eta_min: 0.000001
 
 # Training settings
 training:
-  grad_clip: 1.0
-  save_interval: 10
-  eval_interval: 5
+  amp: true             # mixed precision
 
 # Hardware
 device: cuda
 output_dir: outputs
 ```
 
-## 📈 Results
-
-### Quantization Performance
-
-| Method | Bits | mAP@0.5 | mAP@0.5:0.95 | Size (MB) | FPS |
-|--------|------|---------|--------------|-----------|-----|
-| YOLOv8-FP32 | 32 | 89.3% | 68.1% | 108.3 | 92 |
-| Uniform-4bit | 4 | 82.1% | 58.3% | 13.5 | 156 |
-| **MCAQ-YOLO** | 4.2 | **85.6%** | **63.2%** | 14.2 | 151 |
-
-### Complexity Analysis
-
-| Class | Complexity | Allocated Bits | mAP Drop (3-bit) |
-|-------|------------|----------------|------------------|
-| Person | 0.72 | 5.8 | 17.2% |
-| Helmet | 0.25 | 4.1 | 5.3% |
-| Background | 0.21 | 3.8 | 2.1% |
+> **Note**: The loss weights of Eq.(20) — λ1 (bit budget, annealed 0.01→0.1),
+> λ2 (smoothness), λ3 (distillation, 0.5), λ4 (regularization, 1e-4) — follow
+> the paper's Table X schedule inside `CurriculumScheduler` and are not set
+> from the config file (λ2's base value is `curriculum.lambda_smooth`).
 
 ## 🔧 Advanced Usage
 
-### Custom Morphological Metrics
+### Morphological Complexity Analysis
 ```python
+import torch
 from mcaq_yolo.core.morphology import MorphologicalComplexityAnalyzer
 
-# Create custom analyzer
 analyzer = MorphologicalComplexityAnalyzer(
-    tile_sizes=[8, 16, 32],
-    cache_size=2000,
-    device='cuda'
+    grid_size=8,           # tiles per spatial dimension (8x8 grid)
+    cache_size=10000,
+    device='cuda',
+    metric_backend='gpu',  # 'gpu' (vectorized, training) | 'cv2' (exact, offline)
 )
 
-# Compute complexity for your data
-complexity_map = analyzer(features)
+features = torch.rand(2, 3, 640, 640, device='cuda')
+complexity_map = analyzer(features)          # (B, ht, wt) in [0, 1]
+scores = analyzer.score_image(features)      # (B,) per-image score (Eq.8)
 ```
 
-### Bit Allocation Policies
+### Bit Allocation
 ```python
-from mcaq_yolo.core.bit_allocation import AdaptiveBitAllocation
+from mcaq_yolo.core.bit_allocation import (
+    ComplexityToBitMappingNetwork,  # learnable monotonic MLP (Eq.13-17)
+    LinearBitMapper,                # parameter-free linear ablation
+)
 
-# Use different allocation policies
-allocator = AdaptiveBitAllocation(
+mapper = ComplexityToBitMappingNetwork(
     min_bits=2,
     max_bits=8,
-    target_bits=4.0,
-    policy='exponential'  # 'linear', 'exponential', 'threshold', 'learned'
+    hidden_dims=[32, 64, 32],   # paper Table X
+    enforce_monotonicity=True,  # Eq.18: |W| re-projection
 )
+
+# temperature = alpha_t (Algorithm 3 line 13): anneals 10 -> 1 during training
+bit_map = mapper(complexity_map, temperature=1.0)  # (B, ht, wt), integer bits
 ```
 
-### Curriculum Learning Strategies
+### Curriculum Learning
 ```python
 from mcaq_yolo.core.curriculum import CurriculumScheduler
 
-# Configure curriculum
 curriculum = CurriculumScheduler(
-    warmup_epochs=30,
+    warmup_epochs=20,       # Stage 1 boundary (Twarm, paper Table X)
+    transition_epochs=50,   # Stage 2 boundary (paper Fig.3)
     total_epochs=300,
-    curriculum_type='cosine'  # 'linear', 'exponential', 'cosine', 'step'
+    curriculum_type='exponential',  # 'linear' | 'exponential' | 'cosine' | 'step'
 )
+
+stage = curriculum.get_stage(epoch=30)             # 1 | 2 | 3
+alpha_t = curriculum.get_temperature(epoch=30)     # 1 + 9*exp(-5t/T)
+tau_t = curriculum.get_complexity_threshold(30)    # data-curriculum threshold
+weights = curriculum.get_loss_weights(epoch=30)    # Eq.(20) lambdas
+```
+
+### Analysis Scripts
+```bash
+# M3: post-hoc bit-placement permutation test (does placement matter?)
+python -m mcaq_yolo.scripts.m3_permutation \
+    --checkpoint outputs/<run>/best.pt --data <dataset.yaml> \
+    --train-rel images/train --val-rel images/val
+
+# M4: within-image complexity variation vs. MCAQ gain
+python -m mcaq_yolo.scripts.m4_variation_gain \
+    --ckpt-spatial outputs/<spatial>/best.pt \
+    --ckpt-uniform outputs/<uniform>/best.pt \
+    --data <dataset.yaml> --val-rel images/val
 ```
 
 ## 📁 Project Structure
 ```
-mcaq_yolo/
-├── core/
-│   ├── morphology.py       # Complexity analysis
-│   ├── bit_allocation.py   # Bit mapping network
-│   ├── quantization.py     # Spatial quantization (Updated with CUDA support)
-│   └── curriculum.py       # Curriculum learning
-├── models/
-│   ├── mcaq_yolo.py        # Main model
-│   └── __init__.py
-├── ops/                    # (New) CUDA Kernel & Ops
-│   └── src/
-│       ├── mcaq_kernel.cu  # (New) CUDA Kernel implementation
-│       └── mcaq_ops.cpp    # (New) C++ Binding for PyTorch
-├── engine/                 # (New) TensorRT Plugin
-│   └── MCAQPlugin.cpp      # (New) TensorRT Plugin implementation
-├── utils/
-│   ├── dataset.py          # Data utilities
-│   ├── evaluation.py       # Metrics
-│   ├── visualization.py    # Plotting
-│   └── model_utils.py
-├── configs/                # Configuration files
+mcaq-yolo/                      # repo root
+├── mcaq_yolo/                  # the Python package
+│   ├── core/
+│   │   ├── morphology.py       # complexity analysis (cv2 + GPU backends)
+│   │   ├── bit_allocation.py   # bit mapping network + linear ablation
+│   │   ├── quantization.py     # spatial adaptive quantization (STE / CUDA)
+│   │   └── curriculum.py       # curriculum learning
+│   ├── models/
+│   │   └── mcaq_yolo.py        # main model + combined loss
+│   ├── ops/                    # custom CUDA kernel
+│   │   ├── setup.py            # standalone kernel build script
+│   │   └── src/
+│   │       ├── mcaq_kernel.cu
+│   │       └── mcaq_ops.cpp
+│   ├── engine/
+│   │   └── MCAQPlugin.cpp      # TensorRT plugin (reference)
+│   ├── scripts/                # analysis scripts (M3 / M4)
+│   ├── tests/
+│   │   └── test_smoke.py       # CPU-friendly smoke tests
+│   ├── utils/
+│   │   ├── dataset.py          # data utilities + dataset complexity scoring
+│   │   ├── evaluation.py       # mAP and quantization-impact evaluation
+│   │   ├── visualization.py    # plotting
+│   │   └── model_utils.py
+│   ├── train.py                # Trainer + `mcaq-yolo-train` CLI
+│   └── inference.py            # Predictor + `mcaq-yolo-infer` CLI
+├── configs/
 │   └── train_config.yaml
-├── train.py                # Training script
-├── inference.py            # Inference script
-└── setup.py                # (Modified) Build script for CUDA extensions
+├── examples/
+│   └── train_examples.py
+├── requirements.txt
+└── setup.py                    # package installer (builds the CUDA extension)
 ```
 
 ## 🎓 Citation
@@ -254,11 +289,11 @@ If you use MCAQ-YOLO in your research, please cite:
 
 ## 🤝 Contributing
 
-We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+Contributions are welcome — please open an issue or a pull request.
 
 ## 📄 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License.
 
 ## 🙏 Acknowledgments
 

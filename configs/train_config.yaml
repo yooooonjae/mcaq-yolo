@@ -1,24 +1,23 @@
-# MCAQ-YOLO Training Configuration - Fixed Version
+# MCAQ-YOLO Training Configuration
+# Every key below is consumed by mcaq_yolo.train.Trainer — keys not listed
+# here are ignored. Loss weights (lambda1-4) follow the paper's Table X
+# schedule inside CurriculumScheduler and are not set from this file.
 
 # Model settings
 model:
-  name: yolov8n  # Model variant
-  pretrained: true
-  teacher_path: yolov8n.pt
-  num_classes: 80  # Number of classes
+  name: yolov8n        # Ultralytics model variant
+  teacher_path: yolov8n.pt  # FP32 teacher for knowledge distillation
+  num_classes: 80
 
 # Dataset settings - YOLOv8 format
 data:
   # YOLOv8 dataset yaml (contains path / train / val / names)
   yaml_path: /path/to/dataset.yaml
-  train: images/train  # Relative to dataset root
+  train: images/train  # Relative to the dataset root in the yaml
   val: images/val
 
-  # Data parameters
   img_size: 640
-  batch_size: 16
   num_workers: 8
-  cache: False
 
 # Training hyperparameters
 epochs: 300
@@ -27,28 +26,25 @@ learning_rate: 0.001
 
 # Quantization settings
 quantization:
-  enabled: true
   min_bits: 2
   max_bits: 8
   target_bits: 4.0
-  calibration_mode: percentile
-  per_channel: true
-  smooth_transitions: true
+  grid_size: 8          # tiles per spatial dimension (paper Sec IV-D)
+  bit_mapping: mlp      # 'mlp' (Eq.13-17) | 'linear' (paper's ablation)
+  normalize_complexity: false  # per-image percentile-normalize C before mapping
 
-# Curriculum learning settings
+# Curriculum learning (3-stage schedule, paper Fig.3 / Algorithm 3)
 curriculum:
   enabled: true
-  type: exponential
-  warmup_epochs: 30
+  warmup_epochs: 20     # Stage 1 boundary (paper Table X: Twarm = 20)
+  transition_epochs: 50 # Stage 2 boundary (paper Fig.3)
   initial_complexity: 0.2
   initial_temperature: 10.0
-  initial_bits: 8.0
+  lambda_smooth: 0.1    # Table X lambda2; scale down for finer grids
 
 # Knowledge distillation
 distillation:
   enabled: true
-  temperature: 4.0
-  alpha: 0.7
 
 # Optimizer settings
 optimizer:
@@ -59,16 +55,13 @@ optimizer:
 # Learning rate scheduler
 scheduler:
   type: cosine
-  eta_min: 0.00001
+  warmup_epochs: 5      # LR warmup (distinct from the curriculum's Twarm)
+  eta_min: 0.000001
 
 # Training settings
 training:
-  grad_clip: 10.0
-  save_interval: 10
-  eval_interval: 5
   amp: true  # Mixed precision training
 
 # Hardware settings
 device: cuda
 output_dir: outputs
-seed: 42
