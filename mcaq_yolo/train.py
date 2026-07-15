@@ -193,6 +193,10 @@ class Trainer:
                         and self.device.type == "cuda")
         self.scaler = GradScaler("cuda", enabled=self.use_amp)
 
+        # mAP evaluation cadence: full-val NMS+AP every N epochs (reviewer
+        # note — per-epoch AP can dominate evaluation cost on large val sets).
+        self.map_interval = max(1, int(config.get("training", {}).get("map_interval", 1)))
+
         # distillation, curriculum settings
         self.distill_cfg = config.get("distillation", {})
         self.curriculum_cfg = config.get("curriculum", {})
@@ -706,15 +710,21 @@ class Trainer:
         }
 
     @torch.no_grad()
-    def evaluate(self, quantize: bool = True, temperature: float = 1.0) -> Dict[str, float]:
+    def evaluate(self, quantize: bool = True, temperature: float = 1.0,
+                 compute_map_metric: bool = True) -> Dict[str, float]:
         """
-        Simple validation loop (mAP, etc. may be measured in a separate module;
-        here it is left as a placeholder).
+        Validation loop: val_loss on every call, plus mAP@0.5 (used for
+        best-checkpoint selection) when compute_map_metric is True.
 
         Args:
             quantize: evaluate under the same quantization state as the training
                 stage (False during the Stage 1 warm-up — prevents a
                 train/val regime mismatch)
+            compute_map_metric: decode + NMS + AP over the full validation set.
+                On large val sets this dominates evaluation cost — set
+                training.map_interval > 1 in the config to amortize it
+                (mAP50 is None on skipped epochs and best-checkpoint
+                selection only updates on epochs where it is computed).
             temperature: REVIEW FIX — this used to be fixed at 1.0, so during
                 annealing (Stage 2) training (alpha_t>1, bits saturated upward)
                 and validation ran under different quantization regimes
@@ -751,15 +761,17 @@ class Trainer:
             # REVIEW FIX: also measure mAP@0.5 — best-checkpoint selection should
             # be based on detection performance, not val loss (wires the AP
             # implementation in utils.evaluation into the training loop).
-            B, _, img_h, img_w = imgs.shape
-            dets = _decode_outputs(outputs)
-            tgts = extract_targets_per_image(batch, B, img_w, img_h)
-            for d, t in zip(dets, tgts):
-                all_dets.append(d.float().cpu())
-                all_tgts.append(t)
+            if compute_map_metric:
+                B, _, img_h, img_w = imgs.shape
+                dets = _decode_outputs(outputs)
+                tgts = extract_targets_per_image(batch, B, img_w, img_h)
+                for d, t in zip(dets, tgts):
+                    all_dets.append(d.float().cpu())
+                    all_tgts.append(t)
 
         avg_loss = total_loss / max(1, n_batches)
-        map50 = compute_map(all_dets, all_tgts, iou_thresholds=[0.5])["mAP@0.5"]
+        map50 = (compute_map(all_dets, all_tgts, iou_thresholds=[0.5])["mAP@0.5"]
+                 if compute_map_metric else None)
         return {"val_loss": avg_loss, "mAP50": map50}
 
     # ------------------------------------------------------------------
@@ -781,19 +793,25 @@ class Trainer:
             stage = self.curriculum.get_stage(epoch)
             # Validate under the same quantization regime as training
             # (Stage 1 warm-up: high precision)
+            # mAP cadence: every training.map_interval epochs (always on the
+            # final epoch so short runs still report a number)
+            want_map = (epoch % self.map_interval == 0) or (epoch == self.epochs)
             val_metrics = self.evaluate(
                 quantize=stage >= 2,
                 temperature=self._get_curriculum_temperature(epoch),
+                compute_map_metric=want_map,
             )
 
             if self.scheduler is not None:
                 self.scheduler.step()
 
+            map_str = (f", mAP@0.5: {val_metrics['mAP50']:.4f}"
+                       if val_metrics["mAP50"] is not None else "")
             print(
                 f"Epoch {epoch}/{self.epochs} [S{stage}] "
                 f"- loss: {train_metrics['loss']:.4f}, "
-                f"val_loss: {val_metrics['val_loss']:.4f}, "
-                f"mAP@0.5: {val_metrics['mAP50']:.4f}"
+                f"val_loss: {val_metrics['val_loss']:.4f}"
+                f"{map_str}"
             )
 
             torch.save(self.model.state_dict(), last_weights_path)
@@ -805,7 +823,8 @@ class Trainer:
             # pinned to the FP warm-up checkpoint forever. Now best is chosen by
             # the peak mAP@0.5 of the 'fully-quantized Stage 3' (a detection
             # model's best should be by AP, not by loss).
-            if stage >= 3 and val_metrics["mAP50"] > best_map:
+            if (stage >= 3 and val_metrics["mAP50"] is not None
+                    and val_metrics["mAP50"] > best_map):
                 best_map = val_metrics["mAP50"]
                 torch.save(self.model.state_dict(), best_weights_path)
 

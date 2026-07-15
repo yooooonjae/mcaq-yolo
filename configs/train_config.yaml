@@ -66,7 +66,10 @@ scheduler:
 
 # Training settings
 training:
-  amp: true  # Mixed precision training
+  amp: true  # Mixed precision training (auto-disabled off CUDA)
+  map_interval: 1  # compute full-val mAP@0.5 every N epochs (best-checkpoint
+                   # selection only updates on epochs where mAP is computed;
+                   # raise this to amortize NMS+AP cost on large val sets)
 
 # Reproducibility (review fix): fixes random/numpy/torch(+CUDA) RNGs before
 # model init and dataloader construction; 'deterministic: true' additionally

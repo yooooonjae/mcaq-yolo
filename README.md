@@ -1,5 +1,6 @@
 # MCAQ-YOLO: Morphological Complexity-Aware Quantization for YOLO
 
+[![CI](https://github.com/yooooonjae/mcaq-yolo/actions/workflows/ci.yml/badge.svg)](https://github.com/yooooonjae/mcaq-yolo/actions/workflows/ci.yml)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch 2.0+](https://img.shields.io/badge/pytorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -386,3 +387,17 @@ with v0.1.x are not directly comparable** where noted.
   weights, no paper-table configs/results are distributed yet, and
   dependencies are lower-bounded only. Verified environment for the test
   suite and smoke runs: Python 3.13, torch 2.12, ultralytics 8.4.63 (CPU).
+
+## v0.2.2 — CI, lock file, evaluation cadence (2026-07)
+
+- **CI added.** GitHub Actions runs the smoke test suite on every push/PR
+  (CPU-only ubuntu runner; the CUDA parity test self-skips there).
+- **`requirements-lock.txt` added** — exact pins of the verified
+  environment (Python 3.13.13, torch 2.12.0, ultralytics 8.4.63, …) as a
+  reference pin set for reproducing reported numbers. All comments and
+  messages are now English-only.
+- **`training.map_interval` config key** — compute the full-validation
+  mAP@0.5 every N epochs instead of every epoch (best-checkpoint selection
+  updates only on epochs where mAP is computed); the stale "placeholder"
+  wording in `Trainer.evaluate()`'s docstring was corrected to describe the
+  actual behavior.

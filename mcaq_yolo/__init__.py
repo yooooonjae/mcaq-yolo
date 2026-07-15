@@ -2,7 +2,7 @@
 MCAQ-YOLO: Morphological Complexity-Aware Quantization for YOLO
 """
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 __author__ = "MCAQ-YOLO Team"
 
 # REVIEW FIX (packaging): the previous eager `from .models.mcaq_yolo import

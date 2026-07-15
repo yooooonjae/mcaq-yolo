@@ -1,0 +1,22 @@
+# Exact versions of the VERIFIED environment — the full test suite
+# (16 passed / 1 CUDA-gated skip) and the 1-epoch coco8 CPU smoke run were
+# executed with these pins on macOS arm64, Python 3.13.13 (CPU-only torch).
+#
+# Notes:
+# - This is a reference pin set, not a cross-platform resolution; on other
+#   platforms/Python versions install requirements.txt and treat these as
+#   the versions to prefer when reproducing reported numbers.
+# - tensorboard was NOT installed in the verified environment (it is listed
+#   in requirements.txt for legacy reasons but the code does not import it).
+torch==2.12.0
+torchvision==0.27.0
+ultralytics==8.4.63
+numpy==2.4.6
+opencv-python==4.13.0.92
+scipy==1.17.1
+scikit-image==0.26.0
+matplotlib==3.10.9
+tqdm==4.68.2
+pillow==12.2.0
+pyyaml==6.0.3
+pytest==9.0.3
