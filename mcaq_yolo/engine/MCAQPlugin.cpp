@@ -8,10 +8,10 @@
 
 using namespace nvinfer1;
 
-// [수정 1] extern "C" 제거 -> C++ 링킹 사용
-// mask는 Eq.(19)의 soft mask 융합용(Listing 2) — 이 플러그인은 4-input
-// (input, bit_map, min, max) 계약을 유지하므로 nullptr로 호출하고,
-// m(p) 곱은 TensorRT 그래프의 elementwise 레이어로 적용한다.
+// [Fix 1] Removed extern "C" -> use C++ linkage
+// mask is for the Eq.(19) soft-mask fusion (Listing 2) — this plugin keeps the
+// 4-input (input, bit_map, min, max) contract, so it is called with nullptr and
+// the m(p) multiply is applied as an elementwise layer in the TensorRT graph.
 void launch_spatial_quantization(
     const float* input, const float* bit_map,
     const float* min_vals, const float* max_vals,
@@ -23,7 +23,7 @@ void launch_spatial_quantization(
     cudaStream_t stream
 );
 
-// Plugin Namespace (전역 설정)
+// Plugin Namespace (global configuration)
 namespace {
     const char* PLUGIN_NAME = "MCAQPlugin";
     const char* PLUGIN_VERSION = "1";
@@ -57,7 +57,7 @@ public:
         int H = dims.d[2];
         int W = dims.d[3];
 
-        // 실제 bit_map 그리드 크기 (input[1]: (N, H_tiles, W_tiles))
+        // actual bit_map grid size (input[1]: (N, H_tiles, W_tiles))
         Dims mapDims = inputDesc[1].dims;
         int nTilesH = mapDims.d[1];
         int nTilesW = mapDims.d[2];
@@ -83,13 +83,14 @@ public:
 
     void configurePlugin(const DynamicPluginTensorDesc* in, int nbInputs, const DynamicPluginTensorDesc* out, int nbOutputs) noexcept override {}
 
-    // IPluginV2DynamicExt / IPluginV2의 순수 가상 함수 — 구현이 없으면
-    // 추상 클래스가 되어 인스턴스화(new MCAQPlugin) 자체가 컴파일되지 않는다.
+    // Pure virtual functions of IPluginV2DynamicExt / IPluginV2 — without an
+    // implementation the class stays abstract and instantiation (new MCAQPlugin)
+    // will not even compile.
     int getNbOutputs() const noexcept override { return 1; }
 
     size_t getWorkspaceSize(const PluginTensorDesc* inputs, int nbInputs,
                             const PluginTensorDesc* outputs, int nbOutputs) const noexcept override {
-        return 0;  // 커널이 전부 in-place 산출 — 별도 workspace 불필요
+        return 0;  // the kernel produces everything in-place — no workspace needed
     }
 
     size_t getSerializationSize() const noexcept override { return sizeof(mTileH) + sizeof(mTileW); }
@@ -114,11 +115,11 @@ private:
     std::string mNamespace;
 };
 
-// [수정 2] Plugin Creator 및 등록 매크로 추가 (필수)
+// [Fix 2] Add the Plugin Creator and the registration macro (required)
 class MCAQPluginCreator : public IPluginCreator {
 public:
     MCAQPluginCreator() {
-        // Plugin Field 초기화 (파라미터 정의)
+        // Initialize plugin fields (parameter definitions)
         mPluginAttributes.emplace_back(PluginField("tile_h", nullptr, PluginFieldType::kINT32, 1));
         mPluginAttributes.emplace_back(PluginField("tile_w", nullptr, PluginFieldType::kINT32, 1));
         
@@ -162,5 +163,5 @@ private:
 PluginFieldCollection MCAQPluginCreator::mFC{};
 std::vector<PluginField> MCAQPluginCreator::mPluginAttributes;
 
-// TensorRT에 플러그인 등록
+// Register the plugin with TensorRT
 REGISTER_TENSORRT_PLUGIN(MCAQPluginCreator);

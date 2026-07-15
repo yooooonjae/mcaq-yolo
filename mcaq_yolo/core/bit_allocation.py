@@ -88,9 +88,9 @@ class ComplexityToBitMappingNetwork(nn.Module):
         - (H, W)
         - (B, H, W)
         - (B, 1, H, W)
-        - (B, C, H, W)  (채널 평균 후 사용)
+        - (B, C, H, W)  (used after channel averaging)
 
-    내부적으로 (B, H, W) 형태로 정규화해서 사용한다.
+    Internally normalized to (B, H, W) form before use.
     """
 
     def __init__(
@@ -139,18 +139,18 @@ class ComplexityToBitMappingNetwork(nn.Module):
         self.apply(self._init_weights)
 
     # ---------------------------------------------------
-    # SHAPE 정규화 유틸
+    # SHAPE normalization utility
     # ---------------------------------------------------
     @staticmethod
     def _normalize_complexity_shape(complexity: torch.Tensor) -> torch.Tensor:
         """
         Normalize complexity tensor to shape (B, H, W).
 
-        허용 입력:
+        Accepted inputs:
             - (H, W)           → (1, H, W)
-            - (B, H, W)        → 그대로
-            - (B, 1, H, W)     → 채널 평균 후 (B, H, W)
-            - (B, C, H, W)     → 채널 평균 후 (B, H, W)
+            - (B, H, W)        → unchanged
+            - (B, 1, H, W)     → (B, H, W) after channel averaging
+            - (B, C, H, W)     → (B, H, W) after channel averaging
         """
         if not isinstance(complexity, torch.Tensor):
             raise TypeError(f"complexity must be torch.Tensor, got {type(complexity)}")
@@ -159,10 +159,10 @@ class ComplexityToBitMappingNetwork(nn.Module):
             # (H, W) → (1, H, W)
             complexity = complexity.unsqueeze(0)
         elif complexity.dim() == 3:
-            # (B, H, W) 그대로
+            # (B, H, W) unchanged
             pass
         elif complexity.dim() == 4:
-            # (B, C, H, W) → 채널 평균 후 (B, H, W)
+            # (B, C, H, W) → (B, H, W) after channel averaging
             complexity = complexity.mean(dim=1)
         else:
             raise ValueError(
@@ -244,10 +244,10 @@ class ComplexityToBitMappingNetwork(nn.Module):
         Returns:
             bit_map: Tensor of shape (B, H, W) with bit allocations
         """
-        # 1) shape 정규화 → (B, H, W)
+        # 1) shape normalization → (B, H, W)
         complexity = self._normalize_complexity_shape(complexity)
 
-        # 2) 값 범위 클램프
+        # 2) clamp value range
         complexity = complexity.clamp(0.0, 1.0)
 
         B, H, W = complexity.shape

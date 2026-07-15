@@ -135,7 +135,7 @@ class MorphologicalComplexityAnalyzer(nn.Module):
             pooled = cv2.resize(
                 edge_map.astype(np.float32),
                 (w_new, h_new),
-                interpolation=cv2.INTER_AREA,  # ✅ 유효한 상수
+                interpolation=cv2.INTER_AREA,  # valid constant
             )
             n_boxes = np.sum(pooled > 0)
             if n_boxes > 0:

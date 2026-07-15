@@ -16,8 +16,9 @@ void launch_spatial_quantization(
 );
 
 // PyTorch Interface
-// mask: Eq.(19)의 learned soft mask m(p), (N, 1, H, W) — 주어지면 커널이
-// 양자화와 곱을 융합 수행 (paper Listing 2). 생략 시 양자화만.
+// mask: the learned soft mask m(p) from Eq.(19), (N, 1, H, W) — if given, the
+// kernel fuses quantization with the multiply (paper Listing 2). If omitted,
+// quantization only.
 torch::Tensor spatial_quantize_cuda(
     torch::Tensor input,
     torch::Tensor bit_map,
@@ -45,8 +46,8 @@ torch::Tensor spatial_quantize_cuda(
         mask_ptr = mask->data_ptr<float>();
     }
 
-    // 실제 bit_map 그리드 크기 — 커널이 height/tile_h로 재계산하면
-    // 비정합 케이스에서 OOB (codex 리뷰 반영)
+    // actual bit_map grid size — if the kernel recomputes it as height/tile_h,
+    // it goes OOB in the non-divisible case (from external review)
     int n_tiles_h = bit_map.size(1);
     int n_tiles_w = bit_map.size(2);
 

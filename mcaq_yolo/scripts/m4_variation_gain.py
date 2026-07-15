@@ -110,11 +110,11 @@ def main():
     tu.model.bit_mapper = ConstantMapper(args.uniform_bits)
     recs_u = per_image_records(tu.model, tu.val_loader, args.device)
 
-    # 같은 로더 순서 → 이미지 단위 짝 맞춤
+    # same loader order -> pair up per image
     cstd = np.array([r["cstd"] for r in recs_s])
     gain = np.array([a["ap50"] - b["ap50"] for a, b in zip(recs_s, recs_u)])
 
-    # 분위수 빈 + per-bin 평균 이득 (cluster=image라 단순 bootstrap)
+    # quantile bins + per-bin mean gain (cluster=image, so simple bootstrap)
     qs = np.quantile(cstd, np.linspace(0, 1, args.bins + 1))
     qs[-1] += 1e-9
     rows, rng = [], np.random.default_rng(0)

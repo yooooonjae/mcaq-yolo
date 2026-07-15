@@ -10,7 +10,7 @@ import numpy as np
 from typing import Optional, Tuple, Dict, List
 import warnings
 
-# CUDA Extension 로드 시도 (REVIEW FIX: import 시점 print 부작용 → warnings.warn)
+# Try to load the CUDA extension (REVIEW FIX: print side effect at import time -> warnings.warn)
 try:
     import mcaq_cuda_ops
     HAS_CUDA = True
@@ -441,8 +441,8 @@ class SpatialAdaptiveQuantization(nn.Module):
         percentile_max: float = 99.99
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Percentile-based calibration for outlier robustness."""
-        # 큰 텐서에서 quantile 계산 시 메모리 문제 방지를 위해 샘플링 사용
-        max_samples = 100000  # 최대 샘플 수
+        # Sample to avoid memory issues when computing quantiles on large tensors
+        max_samples = 100000  # maximum number of samples
 
         if self.per_channel:
             # Reshape for per-channel percentile
@@ -450,13 +450,13 @@ class SpatialAdaptiveQuantization(nn.Module):
             C, N = x_reshaped.shape
 
             if N > max_samples:
-                # 랜덤 샘플링
+                # random sampling
                 indices = torch.randperm(N, device=x.device)[:max_samples]
                 x_sampled = x_reshaped[:, indices]
             else:
                 x_sampled = x_reshaped
 
-            # 샘플링된 데이터로 percentile 계산
+            # compute percentile from the sampled data
             x_min = torch.quantile(x_sampled, percentile_min / 100, dim=1, keepdim=True)
             x_max = torch.quantile(x_sampled, percentile_max / 100, dim=1, keepdim=True)
 

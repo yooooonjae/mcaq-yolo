@@ -27,7 +27,7 @@ from ultralytics import YOLO
 from ultralytics.data.build import build_yolo_dataset, build_dataloader
 from ultralytics.cfg import DEFAULT_CFG
 
-from .models.mcaq_yolo import MCAQYOLO  # 네 레포의 MCAQ 모델
+from .models.mcaq_yolo import MCAQYOLO  # the MCAQ model in this repo
 from .core.curriculum import CurriculumScheduler
 from .utils.dataset import compute_dataset_complexity
 from .utils.evaluation import compute_map, extract_targets_per_image, _decode_outputs
@@ -38,9 +38,9 @@ class Trainer:
     """
     MCAQ-YOLO Trainer
 
-    - Ultralytics YOLO 학습 파이프라인을 최대한 그대로 유지
-    - build_yolo_dataset + build_dataloader 사용
-    - morphology / bit allocation / KD / curriculum 모두 여기서 관리
+    - Keeps the Ultralytics YOLO training pipeline as intact as possible
+    - Uses build_yolo_dataset + build_dataloader
+    - Manages morphology / bit allocation / KD / curriculum all here
     """
 
     def __init__(self, config: Dict[str, Any]):
@@ -60,7 +60,7 @@ class Trainer:
         self.device = torch.device(config.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
 
         # --------------------------
-        # 기본 설정
+        # basic settings
         # --------------------------
         # Paper Table X: total epochs = 300. (A default below warmup_epochs=20
         # would keep the curriculum in Stage 1 forever — quantization would
@@ -77,13 +77,13 @@ class Trainer:
         self.imgsz: int = int(data_cfg.get("imgsz", data_cfg.get("img_size", 640)))
 
         # --------------------------
-        # Teacher / Student 모델 설정
+        # Teacher / Student model configuration
         # --------------------------
         model_cfg = config.get("model", {})
         teacher_path = model_cfg.get("teacher_path", "yolov8n.pt")
         num_classes = int(model_cfg.get("num_classes", 80))
 
-        # teacher 경로 절대경로로 변환
+        # convert the teacher path to an absolute path
         teacher_abs = teacher_path
         if not os.path.isabs(teacher_abs):
             project_root = Path(__file__).resolve().parents[1]
@@ -91,14 +91,15 @@ class Trainer:
 
         print(f"[MCAQ] Loaded teacher model from {teacher_abs}")
         self.teacher_model = YOLO(teacher_abs).to(self.device)
-        self.teacher_model.eval()  # KD용
+        self.teacher_model.eval()  # for KD
 
         # --------------------------
-        # 학생(MCAQYOLO) 인스턴스 생성
-        # REVIEW FIX: 이전에는 inspect.signature로 MCAQYOLO의 인자를 런타임에
-        # 탐색했다 — 같은 저장소의 두 클래스 사이 인터페이스를 불투명하게
-        # 만드는 안티패턴. 명시적 생성자 호출로 교체 (시그니처가 바뀌면
-        # 여기서 TypeError로 즉시 드러나는 것이 올바른 실패 방식이다).
+        # Create the student (MCAQYOLO) instance
+        # REVIEW FIX: previously the code probed MCAQYOLO's arguments at runtime
+        # via inspect.signature — an anti-pattern that makes the interface
+        # between two classes in the same repo opaque. Replaced with an explicit
+        # constructor call (if the signature changes, surfacing it immediately
+        # here as a TypeError is the correct failure mode).
         # --------------------------
         quant_cfg = config.get("quantization", {})
 
@@ -107,7 +108,7 @@ class Trainer:
             num_classes=num_classes,
             device=str(self.device),
         )
-        # Quantization settings (Table X 기본값은 MCAQYOLO 쪽 디폴트를 따른다)
+        # Quantization settings (Table X defaults follow the MCAQYOLO-side defaults)
         for key in ("min_bits", "max_bits", "target_bits", "grid_size",
                     "bit_mapping", "normalize_complexity"):
             if key in quant_cfg:
@@ -127,7 +128,7 @@ class Trainer:
         )
 
         # --------------------------
-        # Complexity scores (커리큘럼용)
+        # Complexity scores (for the curriculum)
         # --------------------------
         self.complexity_scores: Optional[torch.Tensor] = None
         self.complexity_path = self.output_dir / "complexity_scores.npy"
@@ -185,14 +186,14 @@ class Trainer:
 
         # --------------------------
         # Mixed precision (torch.amp — torch.cuda.amp is deprecated).
-        # AMP는 CUDA에서만 활성화: CPU/MPS에서 config의 amp:true를 그대로 켜면
-        # 경고/미지원 경로로 빠진다 (REVIEW FIX — 자동 비활성화).
+        # AMP is enabled on CUDA only: honoring config amp:true on CPU/MPS falls
+        # into warning/unsupported code paths (REVIEW FIX — auto-disabled).
         # --------------------------
         self.use_amp = (bool(config.get("training", {}).get("amp", True))
                         and self.device.type == "cuda")
         self.scaler = GradScaler("cuda", enabled=self.use_amp)
 
-        # distillation, curriculum 설정
+        # distillation, curriculum settings
         self.distill_cfg = config.get("distillation", {})
         self.curriculum_cfg = config.get("curriculum", {})
 
@@ -235,10 +236,10 @@ class Trainer:
     # ------------------------------------------------------------------
     def _build_ultra_cfg(self) -> SimpleNamespace:
         """
-        Ultralytics build_yolo_dataset에 넘겨줄 cfg(SimpleNamespace)를 구성.
+        Build the cfg (SimpleNamespace) to pass to Ultralytics build_yolo_dataset.
 
-        - Ultralytics DEFAULT_CFG를 기본으로 사용
-        - 필요한 필드를 덮어쓴다.
+        - Uses Ultralytics DEFAULT_CFG as the base
+        - Overrides the fields we need.
         """
         # Start with DEFAULT_CFG as base (contains all required fields)
         import copy
@@ -252,7 +253,7 @@ class Trainer:
         base["workers"] = self.num_workers
         base["device"] = str(self.device)
 
-        # YOLO 객체에 overrides가 있으면 일부 덮어쓰기
+        # if the YOLO object has overrides, apply some of them
         if hasattr(self.teacher_model, "overrides") and isinstance(self.teacher_model.overrides, dict):
             for key, val in self.teacher_model.overrides.items():
                 if key in base:
@@ -262,7 +263,7 @@ class Trainer:
 
     def _resolve_data_yaml(self) -> Tuple[str, Dict[str, Any]]:
         """
-        config['data']에서 yaml_path (혹은 ppe_yaml 등)를 찾아서 반환.
+        Find and return yaml_path (or ppe_yaml, etc.) from config['data'].
 
         Returns:
             Tuple of (yaml_path, data_dict)
@@ -276,7 +277,7 @@ class Trainer:
         if yaml_path is None:
             raise FileNotFoundError(
                 "Dataset yaml_path not provided in config['data']. "
-                "예: config['data']['yaml_path'] = '/path/to/dataset_ppe.yaml'"
+                "e.g. config['data']['yaml_path'] = '/path/to/dataset_ppe.yaml'"
             )
 
         yaml_path = str(Path(yaml_path).resolve())
@@ -296,7 +297,7 @@ class Trainer:
 
     def _init_datasets(self):
         """
-        Ultralytics YOLODataset을 이용해 학습/검증용 Dataset을 생성.
+        Create the train/val Dataset using the Ultralytics YOLODataset.
         """
         yaml_path, data_dict = self._resolve_data_yaml()
         cfg_ns = self._build_ultra_cfg()
@@ -307,8 +308,8 @@ class Trainer:
 
         if train_img_rel is None or val_img_rel is None:
             raise ValueError(
-                "config['data'] 안에 'train', 'val' 경로가 필요합니다.\n"
-                "예: 'train': 'train/images', 'val': 'val/images'"
+                "config['data'] must contain 'train' and 'val' paths.\n"
+                "e.g. 'train': 'train/images', 'val': 'val/images'"
             )
 
         # Build absolute paths from data_dict['path']
@@ -344,15 +345,15 @@ class Trainer:
 
     def _init_dataloaders(self):
         """
-        Ultralytics 전용 build_dataloader를 사용해서
-        InfiniteDataLoader + 전용 collate_fn을 그대로 쓰도록 설정.
+        Use Ultralytics' dedicated build_dataloader so that the
+        InfiniteDataLoader + its dedicated collate_fn are used as-is.
         """
         train_loader = build_dataloader(
             dataset=self.train_dataset,
             batch=self.batch_size,
             workers=self.num_workers,
             shuffle=True,
-            rank=-1,  # 단일 GPU
+            rank=-1,  # single GPU
         )
 
         val_loader = build_dataloader(
@@ -366,7 +367,7 @@ class Trainer:
         return train_loader, val_loader
 
     # ------------------------------------------------------------------
-    # Complexity (커리큘럼용)
+    # Complexity (for the curriculum)
     # ------------------------------------------------------------------
     def _build_scoring_dataset(self):
         """
@@ -393,11 +394,12 @@ class Trainer:
 
     def _compute_complexity_scores(self) -> torch.Tensor:
         """
-        Morphological complexity score를 전체 train dataset에 대해 계산
-        (증강 미적용 스코어링 데이터셋 사용; 파일 경로로 train 순서에 정렬).
-        캐시는 (backend, imgsz, 파일 목록 md5) 메타와 함께 저장되며 어긋나면
-        자동 재계산한다 — 구버전의 무조건 재사용 캐시는 스코어링 방식이
-        바뀌어도 오염된 값을 계속 썼다.
+        Compute the morphological complexity score over the entire train
+        dataset (using the augmentation-free scoring dataset; aligned to the
+        train order by file path). The cache is stored together with
+        (backend, imgsz, file-list md5) metadata and is automatically
+        recomputed on a mismatch — the old always-reuse cache kept using
+        polluted values even after the scoring method changed.
         """
         import hashlib
         import json
@@ -524,7 +526,7 @@ class Trainer:
     # ------------------------------------------------------------------
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """
-        한 epoch 학습.
+        Train for one epoch.
         """
         self.model.train()
         self.teacher_module.eval()
@@ -574,8 +576,8 @@ class Trainer:
             self.optimizer.zero_grad(set_to_none=True)
 
             with autocast("cuda", enabled=self.use_amp):
-                # 학생 모델 forward (complexity + bit allocation 포함;
-                # Stage 1에서는 quantize=False로 고정밀 warm-up)
+                # student model forward (includes complexity + bit allocation;
+                # in Stage 1 quantize=False for the high-precision warm-up)
                 outputs, aux_info = self.model(imgs, temp, quantize=quantize)
 
                 # FP32 teacher raw outputs for KD (paper Eq.20: L includes
@@ -706,17 +708,19 @@ class Trainer:
     @torch.no_grad()
     def evaluate(self, quantize: bool = True, temperature: float = 1.0) -> Dict[str, float]:
         """
-        간단한 validation 루프 (mAP 등은 별도 모듈에서 측정해도 되고,
-        여기서는 placeholder 형태로 둠)
+        Simple validation loop (mAP, etc. may be measured in a separate module;
+        here it is left as a placeholder).
 
         Args:
-            quantize: 학습 단계와 동일한 양자화 상태로 평가 (Stage 1 warm-up
-                동안에는 False — 학습/검증 레짐 불일치 방지)
-            temperature: REVIEW FIX — 기존에는 1.0으로 고정되어, 어닐링
-                중(Stage 2)에는 학습(alpha_t>1, 비트 상향 포화)과 검증이
-                서로 다른 양자화 레짐으로 돌았다("same regime" 주석과 모순;
-                epoch-1 val_loss 스파이크로 실측). 이제 에폭의 alpha_t를
-                그대로 받아 train/val 레짐을 일치시킨다.
+            quantize: evaluate under the same quantization state as the training
+                stage (False during the Stage 1 warm-up — prevents a
+                train/val regime mismatch)
+            temperature: REVIEW FIX — this used to be fixed at 1.0, so during
+                annealing (Stage 2) training (alpha_t>1, bits saturated upward)
+                and validation ran under different quantization regimes
+                (contradicting the "same regime" comment; measured as an
+                epoch-1 val_loss spike). It now takes the epoch's alpha_t
+                directly so the train/val regimes match.
         """
         self.model.eval()
         total_loss = 0.0
@@ -744,9 +748,9 @@ class Trainer:
             total_loss += loss_det.detach().item()
             n_batches += 1
 
-            # REVIEW FIX: mAP@0.5도 함께 측정 — best checkpoint 선택이 val loss가
-            # 아니라 검출 성능 기준으로 이루어져야 한다 (utils.evaluation의 AP
-            # 구현을 학습 루프에 연결).
+            # REVIEW FIX: also measure mAP@0.5 — best-checkpoint selection should
+            # be based on detection performance, not val loss (wires the AP
+            # implementation in utils.evaluation into the training loop).
             B, _, img_h, img_w = imgs.shape
             dets = _decode_outputs(outputs)
             tgts = extract_targets_per_image(batch, B, img_w, img_h)
@@ -763,7 +767,7 @@ class Trainer:
     # ------------------------------------------------------------------
     def train(self) -> nn.Module:
         """
-        전체 학습 루프.
+        Full training loop.
         """
         print(f"Starting training for {self.epochs} epochs...")
         print(f"Output directory: {self.output_dir}")
@@ -794,18 +798,19 @@ class Trainer:
 
             torch.save(self.model.state_dict(), last_weights_path)
 
-            # REVIEW FIX (best-checkpoint selection): 이전에는 레짐 불문 최소
-            # val_loss로 best.pt를 골랐다 — Stage 1(비양자화 warm-up)의 loss가
-            # 구조적으로 낮아, Stage 2 진입 후 양자화 loss가 그 아래로 내려오지
-            # 않는 한 best.pt가 FP warm-up 체크포인트에 영원히 고정된다.
-            # 이제 best는 '양자화가 완전한 Stage 3'의 mAP@0.5 최고점으로 선택
-            # (검출 모델의 best는 loss가 아니라 AP 기준이 맞다).
+            # REVIEW FIX (best-checkpoint selection): previously best.pt was
+            # chosen by the minimum val_loss regardless of regime — Stage 1's
+            # (non-quantized warm-up) loss is structurally lower, so unless the
+            # quantized loss after entering Stage 2 dips below it, best.pt stays
+            # pinned to the FP warm-up checkpoint forever. Now best is chosen by
+            # the peak mAP@0.5 of the 'fully-quantized Stage 3' (a detection
+            # model's best should be by AP, not by loss).
             if stage >= 3 and val_metrics["mAP50"] > best_map:
                 best_map = val_metrics["mAP50"]
                 torch.save(self.model.state_dict(), best_weights_path)
 
         if best_map < 0:
-            # 짧은 실행(Stage 3 미도달): 마지막 상태를 best로 저장하되 명시적으로 알림
+            # short run (Stage 3 not reached): save the final state as best, but announce it explicitly
             torch.save(self.model.state_dict(), best_weights_path)
             print("[MCAQ] Run ended before Stage 3 — best.pt is the FINAL model "
                   "(no quantized-regime mAP selection happened).")
@@ -818,7 +823,7 @@ class Trainer:
 
 def main(argv: Optional[list] = None) -> None:
     """
-    CLI entry point (`mcaq-yolo-train`): YAML config를 읽어 Trainer를 실행.
+    CLI entry point (`mcaq-yolo-train`): read the YAML config and run the Trainer.
     """
     parser = argparse.ArgumentParser(description="MCAQ-YOLO training")
     parser.add_argument("--config", required=True, help="Path to training config YAML")
