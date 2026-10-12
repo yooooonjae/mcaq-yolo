@@ -36,7 +36,9 @@ quantization:
   min_bits: 2
   max_bits: 8
   target_bits: 4.0
-  grid_size: 8          # tiles per spatial dimension (paper Sec IV-D)
+  grid_sizes: [8, 4, 2] # C3/C4/C5 tiles per axis; 10x10 feature pixels at input 640.
+  # grid_size: 8       # Legacy uniform-grid alternative; omit grid_sizes to use.
+                        # Input-image sample scoring retains a separate 8x8 grid.
   bit_mapping: mlp      # 'mlp' (Eq.13-17) | 'linear' (paper's ablation)
   normalize_complexity: false  # per-image percentile-normalize C before mapping
   allocation_policy: adaptive # adaptive | uniform | shuffle | layerwise | std

@@ -124,12 +124,17 @@ class Trainer:
             control_seed=int(config.get('seed', 0) or 0),
         )
         # Quantization settings (Table X defaults follow the MCAQYOLO-side defaults)
-        for key in ("min_bits", "max_bits", "target_bits", "grid_size",
+        for key in ("min_bits", "max_bits", "target_bits", "grid_size", "grid_sizes",
                     "bit_mapping", "normalize_complexity", "allocation_policy", "smooth_transitions"):
             if key in quant_cfg:
                 model_kwargs[key] = quant_cfg[key]
 
         self.model = MCAQYOLO(**model_kwargs).to(self.device)
+        # Parameter shapes do not encode the feature grid. Save the effective
+        # policy so inference reloads new runs exactly; old scalar configs retain
+        # their uniform feature and sample-scoring grids.
+        if 'grid_size' not in quant_cfg:
+            config.setdefault('quantization', {})['grid_sizes'] = list(self.model.feature_grid_sizes)
         loaded_path = getattr(self.model._yolo_wrapper, 'ckpt_path', None)
         if loaded_path and Path(loaded_path).is_file():
             config['model']['name'] = str(Path(loaded_path).resolve())

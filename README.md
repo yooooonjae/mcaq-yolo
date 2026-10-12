@@ -16,6 +16,7 @@ MCAQ-YOLO introduces a spatial quantization framework for object detection that 
 - **Morphological Complexity Analysis**: Five tile-wise metrics fused by a learnable MLP (exact OpenCV path for offline scoring, vectorized GPU surrogates for training)
 - **Complexity-to-Bit Mapping**: Learnable monotonic MLP (paper Eq.13-17) or a parameter-free linear mapper (the paper's ablation baseline)
 - **Spatial Adaptive Quantization**: Tile-wise mixed precision (2-8 bits) applied to the backbone C3/C4/C5 feature maps via forward hooks, with a learned spatially-smoothed soft mask (Eq.19)
+- **Level-specific grids**: C3/C4/C5 use 8×8, 4×4 and 2×2 tiles, giving 10×10 feature pixels per tile at 640×640 input; old single-grid configurations remain available.
 - **Curriculum Learning**: high-precision warm-up → bounded precision interpolation → full MCAQ, with independent sample-admission and precision controls
 - **Knowledge Distillation**: Logit-level and feature-level matching against an FP32 teacher
 - **Hardware-Aware Design**: Custom CUDA kernel for inference (with an automatic pure-PyTorch fallback) and a TensorRT plugin reference
@@ -91,6 +92,9 @@ Historical paper accuracy, W4 file sizes and deployment FPS have **not** been
 remeasured using this corrected reference implementation.
 The [original manuscript-reported settings](docs/original_experiment_settings.yaml)
 are preserved as a provenance record, not an executable reproduction configuration.
+The author clarified that the original 151 FPS CSE result was **live**, including
+current-image analysis and bit-map construction. It was not a precomputed-map
+replay result. That measurement does not benchmark this corrected implementation.
 
 ### Inference
 ```bash
@@ -159,7 +163,7 @@ quantization:
   min_bits: 2
   max_bits: 8
   target_bits: 4.0
-  grid_size: 8          # tiles per spatial dimension
+  grid_sizes: [8, 4, 2] # tile counts per axis, in C3/C4/C5 order
   bit_mapping: mlp      # 'mlp' (Eq.13-17) | 'linear' (paper's ablation)
   normalize_complexity: false
   allocation_policy: adaptive
@@ -215,7 +219,7 @@ import torch
 from mcaq_yolo.core.morphology import MorphologicalComplexityAnalyzer
 
 analyzer = MorphologicalComplexityAnalyzer(
-    grid_size=8,           # tiles per spatial dimension (8x8 grid)
+    grid_size=8,           # default input-image grid; feature calls can override it
     device='cuda',
     metric_backend='gpu',  # 'gpu' (vectorized, training) | 'cv2' (exact, offline)
 )
@@ -274,9 +278,11 @@ python -m mcaq_yolo.scripts.m4_variation_gain \
     --data <dataset.yaml> --val-rel images/val
 ```
 
-### Precomputed-map inference
+### Live inference and optional map reuse
 
-The default forward pass computes morphology from the C3/C4/C5 feature maps.
+The default forward pass computes morphology from the current C3/C4/C5 feature maps.
+Original paper throughput was measured in live mode; the following optional API
+serves repeated-input and controlled spatial-placement experiments.
 For repeated inference on an already known, identically preprocessed input,
 the model can explicitly consume precomputed per-scale maps:
 
@@ -300,7 +306,8 @@ or implement the paper's approximate streaming LSH cache.
 ### Spatial quantization corrections
 
 - `grid_size=8` now means eight tiles along each spatial axis, capped by the
-  feature dimensions for tiny maps. Both morphology backends retain all border
+  feature dimensions for tiny maps. With the revised default `grid_sizes=[8,4,2]`,
+  counts differ across C3/C4/C5. Both morphology backends retain all border
   pixels and use the same proportional partition as nearest-neighbor bit-map
   upsampling. Dyadic box counting operates inside rectangular tiles and includes
   partial boundary boxes; tiles smaller than four pixels along either axis use

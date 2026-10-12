@@ -28,7 +28,7 @@ class MorphologicalComplexityAnalyzer(nn.Module):
 
     def __init__(
         self,
-        grid_size: int = 8,        # Paper Sec IV-D: tile size defaults to H/8 (8x8 grid)
+        grid_size: int = 8,        # Default input-image scoring grid; feature hooks override per call.
         device: str = "cuda",
         metric_backend: str = "gpu",  # 'gpu' (vectorized surrogates) | 'cv2' (exact Eq.21-24)
         canny_impl: str = "cv2compat",    # 'cv2compat' (default) | 'legacy'
@@ -39,21 +39,20 @@ class MorphologicalComplexityAnalyzer(nn.Module):
         Initialize the morphological complexity analyzer.
 
         Args:
-            grid_size: Number of tiles per spatial dimension (paper default 8x8 grid;
-                       finer 16x16 grids may be used for high object density, Eq.12)
+            grid_size: Default number of tiles per axis for input-image scoring.
+                Feature hooks pass their own level's grid without changing this value.
             device: Device to run computations on
             metric_backend:
                 'cv2' — exact per-tile metrics via OpenCV (Canny+Otsu edge maps,
-                        per-contour Eq.24). CPU-bound; matches the paper's
-                        calibration-time analysis exactly. Used for offline
-                        dataset scoring and calibration.
+                        per-contour Eq.24). CPU-bound reference for dataset
+                        scoring, calibration, and backend comparisons.
                 'gpu' — vectorized tensor surrogates for per-batch training use
                         (Otsu-thresholded Sobel magnitude approximates Canny;
                         tile-level single-region circularity approximates the
                         per-contour Eq.24). Documented approximation.
         """
         super().__init__()
-        if not isinstance(grid_size, int) or grid_size < 1:
+        if type(grid_size) is not int or grid_size < 1:
             raise ValueError("grid_size must be a positive integer")
         self.grid_size = grid_size
         self.device = device
@@ -352,13 +351,16 @@ class MorphologicalComplexityAnalyzer(nn.Module):
     # ------------------------------------------------------------------
     # GPU tile-wise metric helpers (vectorized; deterministic side-information)
     # ------------------------------------------------------------------
-    def _grid_bounds(self, length: int):
+    def _grid_bounds(self, length: int, grid_size: Optional[int] = None):
         """Non-overlapping tiles matching nearest upsampling: floor(p*G/L).
 
         ceil(i*L/G) boundaries cover every pixel, including remainder borders.
         Tiny features use one tile per pixel instead of empty tiles.
         """
-        count = min(self.grid_size, length)
+        grid_size = self.grid_size if grid_size is None else grid_size
+        if type(grid_size) is not int or grid_size < 1:
+            raise ValueError("grid_size must be a positive integer")
+        count = min(grid_size, length)
         return [(i * length + count - 1) // count for i in range(count + 1)]
 
     @staticmethod
@@ -721,15 +723,15 @@ class MorphologicalComplexityAnalyzer(nn.Module):
         phi5 = torch.where(area.squeeze(1) > 0, phi5.squeeze(1), torch.zeros_like(phi5.squeeze(1)))
         return phi5
 
-    def _phi_tiles_cv2(self, features: torch.Tensor):
+    def _phi_tiles_cv2(self, features: torch.Tensor, grid_size: Optional[int] = None):
         """
         Exact per-tile metrics via the OpenCV reference implementations
         (paper Eq.21-24 with Canny+Otsu edge maps and per-contour circularity).
-        CPU-bound — intended for offline dataset scoring / calibration-time
-        analysis (the paper runs morphological analysis at calibration time).
+        CPU-bound reference for offline dataset scoring and backend comparison;
+        using this backend still computes descriptors on each supplied input.
         """
         B, C, H, W = features.shape
-        rows, cols = self._grid_bounds(H), self._grid_bounds(W)
+        rows, cols = self._grid_bounds(H, grid_size), self._grid_bounds(W, grid_size)
         ht, wt = len(rows) - 1, len(cols) - 1
 
         imgs = features.detach().float().cpu()
@@ -778,7 +780,7 @@ class MorphologicalComplexityAnalyzer(nn.Module):
         dev = features.device
         return phi.to(dev), {k: v.to(dev) for k, v in detailed.items()}
 
-    def compute_phi_tiles(self, features: torch.Tensor):
+    def compute_phi_tiles(self, features: torch.Tensor, grid_size: Optional[int] = None):
         """
         Compute the five normalized morphological descriptors per tile (no_grad —
         paper: 'descriptors are computed as deterministic side-information').
@@ -788,6 +790,8 @@ class MorphologicalComplexityAnalyzer(nn.Module):
 
         Args:
             features: (B, C, H, W)
+            grid_size: Per-call tile count per axis; leaves the input-image
+                scoring grid and all shared analyzer parameters unchanged.
 
         Returns:
             phi: (B, ht, wt, 8) tensor [phi1..phi5, phi1*phi2, phi3^2, sqrt(phi4*phi5)]
@@ -797,7 +801,7 @@ class MorphologicalComplexityAnalyzer(nn.Module):
             raise ValueError("features must be a nonempty (B,C,H,W) tensor")
         if self.metric_backend == "cv2":
             with torch.no_grad():
-                return self._phi_tiles_cv2(features)
+                return self._phi_tiles_cv2(features, grid_size)
 
         # AMP guard: the hooks run inside the trainer's autocast region, where
         # F.conv2d would emit fp16 tensors — but torch.histc (Otsu) does not
@@ -805,11 +809,11 @@ class MorphologicalComplexityAnalyzer(nn.Module):
         # (deterministic side-information; precision matters more than speed).
         if features.is_cuda:
             with torch.amp.autocast("cuda", enabled=False):
-                return self._phi_tiles_gpu(features.float())
-        return self._phi_tiles_gpu(features.float())
+                return self._phi_tiles_gpu(features.float(), grid_size)
+        return self._phi_tiles_gpu(features.float(), grid_size)
 
     @torch.no_grad()
-    def _phi_tiles_gpu(self, features: torch.Tensor):
+    def _phi_tiles_gpu(self, features: torch.Tensor, grid_size: Optional[int] = None):
         """Describe the exact configured grid, batching equal-size rectangles.
 
         Local operators run inside each tile, as in the OpenCV backend. At
@@ -817,7 +821,7 @@ class MorphologicalComplexityAnalyzer(nn.Module):
         Normalization is per image, before extracting tiles.
         """
         B, _, H, W = features.shape
-        rows, cols = self._grid_bounds(H), self._grid_bounds(W)
+        rows, cols = self._grid_bounds(H, grid_size), self._grid_bounds(W, grid_size)
         ht, wt = len(rows) - 1, len(cols) - 1
         gray = self._normalize01(features.mean(dim=1, keepdim=True).float())
         groups = {}
@@ -918,6 +922,7 @@ class MorphologicalComplexityAnalyzer(nn.Module):
         self,
         features: torch.Tensor,
         return_detailed: bool = False,
+        grid_size: Optional[int] = None,
     ):
         """
         Morphological complexity computation (Algorithm 1).
@@ -929,12 +934,13 @@ class MorphologicalComplexityAnalyzer(nn.Module):
         Args:
             features: Tensor of shape (B, C, H, W)
             return_detailed: If True, also return the 5 individual metrics
+            grid_size: Optional per-feature-level grid override (no state mutation).
 
         Returns:
             complexity_map: (B, ht, wt) in [0, 1]
             detailed_metrics: dict of individual metrics (if return_detailed=True)
         """
-        phi, detailed = self.compute_phi_tiles(features)
+        phi, detailed = self.compute_phi_tiles(features, grid_size=grid_size)
         B, ht, wt, _ = phi.shape
 
         # Algorithm 1 line 15: C <- MLP(phi)

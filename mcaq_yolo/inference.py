@@ -99,7 +99,10 @@ class Predictor:
             min_bits=config.get('quantization', {}).get('min_bits', 2),
             max_bits=config.get('quantization', {}).get('max_bits', 8),
             target_bits=config.get('quantization', {}).get('target_bits', 4),
-            grid_size=config.get('quantization', {}).get('grid_size', 8),
+            grid_size=(config.get('quantization', {}).get('grid_size')
+                       if config.get('quantization', {}).get('grid_sizes') is not None
+                       else config.get('quantization', {}).get('grid_size', 8)),
+            grid_sizes=config.get('quantization', {}).get('grid_sizes'),
             bit_mapping=config.get('quantization', {}).get('bit_mapping', 'mlp'),
             normalize_complexity=config.get('quantization', {}).get('normalize_complexity', False),
             allocation_policy=config.get('quantization', {}).get('allocation_policy', 'adaptive'),

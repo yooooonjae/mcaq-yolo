@@ -58,6 +58,8 @@ def write_manifest(config, output_dir, model=None, datasets=None):
         manifest['model'] = dict(architecture=model.model.yaml,
                                  classes=model.model.names,
                                  feature_layers=model.backbone_out_indices,
+                                 feature_grid_sizes=list(model.feature_grid_sizes),
+                                 sample_score_grid_size=model.complexity_analyzer.grid_size,
                                  allocation_policy=model.allocation_policy,
                                  gate=model.smooth_transitions,
                                  descriptor_backend=model.complexity_analyzer.metric_backend)
@@ -218,6 +220,12 @@ def main(argv=None):
             raise ValueError('paired-checkpoint requires an adaptive run config')
         if (root / 'paired_result.json').exists():
             raise FileExistsError('paired_result.json already exists; use a fresh output directory')
+        # Archived configs without a grid field were trained with uniform8.
+        # New training persists grid_sizes, but checkpoint parameter shapes alone
+        # cannot distinguish the policies during this evaluation-only path.
+        quantization = base.setdefault('quantization', {})
+        if 'grid_size' not in quantization and 'grid_sizes' not in quantization:
+            quantization['grid_size'] = 8
         base['output_dir'] = str(root)
         trainer = Trainer(base)
         trainer.model.load_state_dict(torch.load(args.paired_checkpoint, map_location=trainer.device, weights_only=True))

@@ -57,12 +57,13 @@ augmentation:
   horizontal_flip_probability: 0.5
 deployment_measurements:
   gpu: NVIDIA RTX PRO 6000 Blackwell
-  cse_precomputed_fps: 151
-  cse_online_fps_approximate: 127
+  cse_live_fps: 151
+  cse_fast_live_fps: 158
   coco_online_fps: 158
   voc_online_fps: 163
-  coco_voc_mode_source: author_confirmation_2026_10_12
-  cse_precomputed_energy_j_per_image: 0.14
+  measurement_mode: live_current_image_analysis_and_map_construction_included
+  mode_source: author_correction_2026_10_12
+  cse_live_energy_j_per_image: 0.14
 class_summary_provenance:
   reported_ap_drop: {person: 17.2, helmet: 5.3}
   ap_drop_reference_precision_pair: null

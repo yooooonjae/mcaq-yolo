@@ -101,6 +101,23 @@ distinct from retraining with shuffle. The reference model must be adaptive.
 
 ## Saved evidence
 
+The revised default sets `quantization.grid_sizes: [8, 4, 2]` in C3/C4/C5 order.
+At 640×640 input, the stride-8/16/32 feature maps are 80×80, 40×40 and 20×20,
+so each level has 10×10 feature pixels per tile. This removes the size-forced
+C5 fractal fallback and allows contours to exceed the reference area threshold;
+flat content can still give constant descriptors. The shared analyzer receives
+each level's grid explicitly. Sample-admission image ranking retains a separate
+8×8 grid. Quantization, standard-deviation controls, map validation and paired
+shuffle use the same per-level partition.
+
+For a grid-only comparison, run the same seeds, initialization and schedule with
+`grid_sizes: [8, 8, 8]` and `[8, 4, 2]` in separate output directories. Record
+achieved bit budgets and per-level descriptor statistics; a common bit target
+alone does not guarantee equal achieved cost. Existing scalar `grid_size`
+configurations preserve uniform-grid behavior. Keep the saved resolved config
+beside its checkpoint to reproduce its grid policy during inference. Original
+paper accuracy and live throughput have not been remeasured with the new grids.
+
 Every run saves `manifest.json` (configuration, package versions, source hashes,
 available input hashes), `resolved_config.yaml`, `history.jsonl`, `best.pt`,
 `last.pt`, and `result.json` (selected checkpoint hash and evaluation at the final

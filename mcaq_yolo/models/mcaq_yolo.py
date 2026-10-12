@@ -238,15 +238,24 @@ class MCAQYOLO(nn.Module):
         target_bits: float = 4.0,
         device: str = 'cuda',
         num_classes: int = 80,  # Added num_classes parameter
-        grid_size: int = 8,  # Paper Sec IV-D default 8x8; Eq.12 allows 16/32 for dense scenes
+        grid_size: Optional[int] = None,  # Explicit scalar retains the legacy uniform grid.
         bit_mapping: str = 'mlp',  # 'mlp' (Eq.13-17) | 'linear' (paper's Linear-mapping ablation)
         normalize_complexity: bool = False,
         allocation_policy: str = 'adaptive',
         smooth_transitions: bool = True,
         control_seed: int = 0,
+        grid_sizes: Optional[List[int]] = None,  # C3/C4/C5 defaults: 8/4/2.
     ):
         super().__init__()
 
+        if grid_size is not None and grid_sizes is not None:
+            raise ValueError('specify grid_sizes or legacy grid_size, not both')
+        if grid_size is not None and (type(grid_size) is not int or grid_size < 1):
+            raise ValueError('grid_size must be a positive integer')
+        if grid_sizes is not None and (
+                not isinstance(grid_sizes, (list, tuple)) or not grid_sizes
+                or any(type(grid) is not int or grid < 1 for grid in grid_sizes)):
+            raise ValueError('grid_sizes must contain positive integers')
         if allocation_policy not in ('adaptive', 'uniform', 'shuffle', 'layerwise', 'std'):
             raise ValueError('unknown allocation_policy')
         if not 2 <= min_bits <= target_bits <= max_bits <= 8:
@@ -290,11 +299,12 @@ class MCAQYOLO(nn.Module):
         # Use object.__setattr__ to bypass nn.Module's attribute registration
         object.__setattr__(self, '_yolo_wrapper', _yolo_wrapper)
         
-        # Initialize components (paper Sec IV-D: default 8x8 tile grid).
+        # One shared analyzer: the base grid is for input-image sample scoring;
+        # hooks pass their level's grid explicitly without changing module state.
         # NOTE (documented deviation): the paper's Table X tile cache is not
         # implemented — see MorphologicalComplexityAnalyzer.__init__.
         self.complexity_analyzer = MorphologicalComplexityAnalyzer(
-            grid_size=grid_size,
+            grid_size=grid_size if grid_size is not None else 8,
             device=device
         )
         
@@ -358,6 +368,11 @@ class MCAQYOLO(nn.Module):
         # ------------------------------------------------------------------
         self._mcaq_state: Dict = {'active': False}
         self.backbone_out_indices = self._find_backbone_out_indices()
+        self.feature_grid_sizes = ((grid_size,) * len(self.backbone_out_indices)
+                                   if grid_size is not None else tuple(grid_sizes or (8, 4, 2)))
+        if len(self.feature_grid_sizes) != len(self.backbone_out_indices):
+            raise ValueError('grid_sizes must contain one grid per discovered backbone feature level')
+        self.feature_grid_by_layer = dict(zip(self.backbone_out_indices, self.feature_grid_sizes))
         self._register_mcaq_hooks()
         
     # ------------------------------------------------------------------
@@ -429,16 +444,21 @@ class MCAQYOLO(nn.Module):
                 return None
 
             feat = output
+            grid_size = self.feature_grid_by_layer[layer_idx]
             detailed = {}
             precomputed = state.get('precomputed_bit_maps')
             if precomputed is not None:
                 complexity = None  # deliberately not recomputed on this path
                 bit_map = precomputed[layer_idx].to(device=feat.device, dtype=torch.float32)
+                expected_grid = tuple(min(grid_size, size) for size in feat.shape[-2:])
+                if tuple(bit_map.shape[-2:]) != expected_grid:
+                    raise ValueError(f'precomputed bit_map grid for layer {layer_idx} must be {expected_grid}')
             else:
                 if self.allocation_policy == 'std':
-                    complexity = feature_std_complexity(feat, self.complexity_analyzer.grid_size)
+                    complexity = feature_std_complexity(feat, grid_size)
                 else:
-                    complexity, detailed = self.complexity_analyzer(feat, return_detailed=True)
+                    complexity, detailed = self.complexity_analyzer(
+                        feat, return_detailed=True, grid_size=grid_size)
                 if self.normalize_complexity:
                     B = complexity.shape[0]
                     flat = complexity.reshape(B, -1)
@@ -656,8 +676,9 @@ class MCAQYOLO(nn.Module):
             complexity_maps = [r['complexity'] for r in aux_records]
 
             if bit_maps:
-                # Paper Table II footnote: activation bits = spatial average
-                # across tiles (here: across all scales' tiles)
+                # The policy budget gives each feature level equal weight,
+                # regardless of its tile count. Element-weighted bits are a
+                # separate diagnostic, never substituted into this objective.
                 avg_bits = torch.stack([m.float().mean() for m in bit_maps]).mean()
             else:
                 avg_bits = torch.tensor(float(self.target_bits), device=x.device)
