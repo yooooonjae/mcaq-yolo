@@ -14,7 +14,8 @@ import warnings
 import copy
 
 from ..core.morphology import MorphologicalComplexityAnalyzer
-from ..core.bit_allocation import ComplexityToBitMappingNetwork, LinearBitMapper
+from ..core.bit_allocation import (ComplexityToBitMappingNetwork, LinearBitMapper,
+                                   interpolate_precision, apply_allocation_policy, feature_std_complexity)
 from ..core.quantization import SpatialAdaptiveQuantization
 
 
@@ -25,6 +26,10 @@ def _extract_raw_maps(outputs) -> List[torch.Tensor]:
     - train mode: DetectionModel returns the raw list directly
     - eval mode: Detect returns (y_cat, raw_list)
     """
+    if isinstance(outputs, tuple) and len(outputs) == 2 and isinstance(outputs[1], dict):
+        return _extract_raw_maps(outputs[1])
+    if isinstance(outputs, dict):
+        return [outputs[key] for key in ('boxes', 'scores') if torch.is_tensor(outputs.get(key))]
     if isinstance(outputs, (list, tuple)):
         if (
             len(outputs) == 2
@@ -148,11 +153,11 @@ class MCAQYOLOLoss(nn.Module):
             loss_det = loss_tensor.sum()
             loss_dict['loss_det'] = loss_det
             # Add individual loss components
-            loss_dict.update({
-                'box_loss': loss_items[0].item() if len(loss_items) > 0 else 0,
-                'cls_loss': loss_items[1].item() if len(loss_items) > 1 else 0,
-                'dfl_loss': loss_items[2].item() if len(loss_items) > 2 else 0,
-            })
+            if isinstance(loss_items, dict):
+                loss_dict.update({key: float(value) for key, value in loss_items.items()})
+            else:
+                loss_dict.update({name: float(loss_items[i]) for i, name in
+                                  enumerate(('box_loss', 'cls_loss', 'dfl_loss'))})
         else:
             # Fallback to simple MSE
             targets = batch.get('labels', batch)
@@ -235,14 +240,24 @@ class MCAQYOLO(nn.Module):
         num_classes: int = 80,  # Added num_classes parameter
         grid_size: int = 8,  # Paper Sec IV-D default 8x8; Eq.12 allows 16/32 for dense scenes
         bit_mapping: str = 'mlp',  # 'mlp' (Eq.13-17) | 'linear' (paper's Linear-mapping ablation)
-        normalize_complexity: bool = False  # per-image percentile-normalize C before the mapper
+        normalize_complexity: bool = False,
+        allocation_policy: str = 'adaptive',
+        smooth_transitions: bool = True,
+        control_seed: int = 0,
     ):
         super().__init__()
 
+        if allocation_policy not in ('adaptive', 'uniform', 'shuffle', 'layerwise', 'std'):
+            raise ValueError('unknown allocation_policy')
+        if not 2 <= min_bits <= target_bits <= max_bits <= 8:
+            raise ValueError('require 2 <= min_bits <= target_bits <= max_bits <= 8')
+        self.allocation_policy = allocation_policy
+        self.smooth_transitions = bool(smooth_transitions)
+        self.control_seed = int(control_seed)
         # Load base YOLOv8 model
         # Note: Use temporary variable to avoid registering YOLO wrapper as submodule
         if pretrained:
-            _yolo_wrapper = YOLO(f'{model_name}.pt')
+            _yolo_wrapper = YOLO(model_name if str(model_name).endswith('.pt') else f'{model_name}.pt')
         else:
             _yolo_wrapper = YOLO(model_name)
 
@@ -414,12 +429,16 @@ class MCAQYOLO(nn.Module):
                 return None
 
             feat = output
+            detailed = {}
             precomputed = state.get('precomputed_bit_maps')
             if precomputed is not None:
                 complexity = None  # deliberately not recomputed on this path
                 bit_map = precomputed[layer_idx].to(device=feat.device, dtype=torch.float32)
             else:
-                complexity = self.complexity_analyzer(feat)
+                if self.allocation_policy == 'std':
+                    complexity = feature_std_complexity(feat, self.complexity_analyzer.grid_size)
+                else:
+                    complexity, detailed = self.complexity_analyzer(feat, return_detailed=True)
                 if self.normalize_complexity:
                     B = complexity.shape[0]
                     flat = complexity.reshape(B, -1)
@@ -428,8 +447,17 @@ class MCAQYOLO(nn.Module):
                     complexity = ((complexity - lo) / (hi - lo + 1e-8)).clamp(0.0, 1.0)
                 bit_map = self.bit_mapper(
                     complexity, state.get('temperature', 1.0),
-                    return_continuous=self.training,
+                    return_continuous=True,
                 )
+                bit_map = apply_allocation_policy(
+                    bit_map, feat.shape[-2:], 'adaptive' if self.allocation_policy == 'std' else self.allocation_policy,
+                    uniform_bits=self.target_bits, seed=self.control_seed + layer_idx,
+                )
+                progress = state.get('precision_progress')
+                if progress is not None:
+                    bit_map = interpolate_precision(bit_map, progress, self.max_bits)
+                if not self.training:
+                    bit_map = bit_map.round()
 
             quantize = state.get('quantize', True)
             quantizer = self.quantizers[str(layer_idx)]
@@ -441,6 +469,7 @@ class MCAQYOLO(nn.Module):
                 'complexity': complexity,
                 'bit_map': bit_map,
                 'features_q': feat_q,
+                'descriptors': detailed,
             })
             return feat_q if quantize else None
 
@@ -455,12 +484,29 @@ class MCAQYOLO(nn.Module):
                 # Independent quantizer per scale (distinct per-channel EMA stats)
                 self.quantizers[str(idx)] = SpatialAdaptiveQuantization(
                     calibration_mode='minmax',
-                    smooth_transitions=True,
+                    smooth_transitions=self.smooth_transitions,
                     per_channel=True,
                 ).to(self.device)
                 self._mcaq_hooks.append(
                     layers[idx].register_forward_hook(self._make_mcaq_hook(idx))
                 )
+
+    @torch.no_grad()
+    def paired_shuffle_forward(self, x):
+        """Paired endpoint intervention with identical per-level bit budgets.
+
+        Compute every reference map once, then replay their shuffled versions.
+        Later feature changes cannot silently change downstream map histograms.
+        """
+        if self.training or self.allocation_policy != 'adaptive':
+            raise ValueError('paired shuffle requires an adaptive model in eval mode')
+        reference = self(x, precision_progress=1.)
+        aux = reference[1]
+        maps = [apply_allocation_policy(bits, feat.shape[-2:], 'shuffle',
+                                       seed=self.control_seed + layer)
+                for layer, bits, feat in zip(aux['feature_layers'], aux['bit_map'], aux['quantized_features'])]
+        shuffled = self(x, precomputed_bit_maps=maps, precision_progress=1.)
+        return reference, shuffled
 
     @torch.no_grad()
     def precompute_bit_maps(self, x: torch.Tensor) -> List[torch.Tensor]:
@@ -544,6 +590,7 @@ class MCAQYOLO(nn.Module):
         targets: Optional[Dict] = None,
         quantize: bool = True,
         precomputed_bit_maps: Optional[List[torch.Tensor]] = None,
+        precision_progress: Optional[float] = None,
     ) -> Tuple[torch.Tensor, Optional[Dict]]:
         """
         Forward pass with adaptive quantization.
@@ -555,7 +602,9 @@ class MCAQYOLO(nn.Module):
 
         Args:
             x: Input images (B, 3, H, W)
-            temperature: alpha_t for bit allocation (Algorithm 3)
+            temperature: Legacy multiplicative schedule; use 1 with precision_progress.
+            precision_progress: Convex continuation from max_bits to the base policy;
+                0 for warm-up, 1 for the final policy. None retains legacy API behavior.
             return_aux: Whether to return auxiliary information
             targets: Target labels for training
             precomputed_bit_maps: Optional integer maps in backbone_out_indices order.
@@ -569,9 +618,13 @@ class MCAQYOLO(nn.Module):
             outputs: Detection outputs
             aux_info: Auxiliary information (if return_aux=True)
         """
+        if precision_progress is not None:
+            if not 0 <= precision_progress <= 1 or temperature != 1.0:
+                raise ValueError('precision_progress requires [0,1] and temperature=1')
         prepared_maps = None
         if precomputed_bit_maps is not None:
-            if self.training or not quantize or temperature != 1.0:
+            if (self.training or not quantize or temperature != 1.0
+                    or precision_progress not in (None, 1.0)):
                 raise ValueError("precomputed maps require quantized inference at temperature=1")
             if len(precomputed_bit_maps) != len(self.backbone_out_indices):
                 raise ValueError("precomputed_bit_maps must contain one map per backbone scale")
@@ -587,6 +640,7 @@ class MCAQYOLO(nn.Module):
         self._mcaq_state = {
             'active': True,
             'temperature': temperature,
+            'precision_progress': precision_progress,
             'quantize': quantize,
             'aux': [],
             'precomputed_bit_maps': prepared_maps,
@@ -614,7 +668,7 @@ class MCAQYOLO(nn.Module):
                 'avg_bits': avg_bits,
                 'quantized_features': [r['features_q'] for r in aux_records],
                 'feature_layers': [r['layer'] for r in aux_records],
-                'detailed_metrics': {},
+                'detailed_metrics': [r['descriptors'] for r in aux_records],
             }
             return outputs, aux_info
 

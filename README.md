@@ -16,7 +16,7 @@ MCAQ-YOLO introduces a spatial quantization framework for object detection that 
 - **Morphological Complexity Analysis**: Five tile-wise metrics fused by a learnable MLP (exact OpenCV path for offline scoring, vectorized GPU surrogates for training)
 - **Complexity-to-Bit Mapping**: Learnable monotonic MLP (paper Eq.13-17) or a parameter-free linear mapper (the paper's ablation baseline)
 - **Spatial Adaptive Quantization**: Tile-wise mixed precision (2-8 bits) applied to the backbone C3/C4/C5 feature maps via forward hooks, with a learned spatially-smoothed soft mask (Eq.19)
-- **Curriculum Learning**: 3-stage schedule (high-precision warm-up → transition → full MCAQ) with temperature annealing and complexity-ordered data sampling
+- **Curriculum Learning**: high-precision warm-up → bounded precision interpolation → full MCAQ, with independent sample-admission and precision controls
 - **Knowledge Distillation**: Logit-level and feature-level matching against an FP32 teacher
 - **Hardware-Aware Design**: Custom CUDA kernel for inference (with an automatic pure-PyTorch fallback) and a TensorRT plugin reference
 
@@ -62,6 +62,26 @@ mcaq-yolo-train \
 
 The best weights (highest quantized Stage-3 validation mAP@0.5) are saved to
 `<output_dir>/best.pt`. Runs ending before Stage 3 save the final model instead.
+
+### Corrected schedule and matched controls
+
+The default now uses `b(t) = (1-r)*8 + r*b_base`, with `r` increasing from
+0 to 1 over epochs 21–50. Its target follows the same interpolation to four
+bits, eliminating the old multiply-and-clip saturation plateau. The explicit
+`legacy_multiply` mode remains available for comparison.
+
+```bash
+python -m mcaq_yolo.experiments --config configs/train_config.yaml \
+  --data /data/cse/data.yaml --student /models/student_initial.pt \
+  --teacher /models/teacher.pt --output-dir outputs/controls --seeds 0 1 2 3 4
+```
+
+This runs the 2×2 curriculum experiment plus uniform, shuffled, gate-off,
+layerwise, feature-standard-deviation, and legacy controls. Every run saves
+actual per-level bit/descriptor diagnostics, source/config/checkpoint provenance,
+and endpoint evaluation. See [the protocol and exact-budget paired shuffle](docs/controlled_experiments.md).
+Historical paper accuracy, W4 file sizes and deployment FPS have **not** been
+remeasured using this corrected reference implementation.
 
 ### Inference
 ```bash
@@ -133,14 +153,19 @@ quantization:
   grid_size: 8          # tiles per spatial dimension
   bit_mapping: mlp      # 'mlp' (Eq.13-17) | 'linear' (paper's ablation)
   normalize_complexity: false
+  allocation_policy: adaptive
+  smooth_transitions: true
 
 # Curriculum learning (3-stage schedule)
 curriculum:
   enabled: true
+  schedule_mode: interpolate
+  sample_enabled: true
+  precision_enabled: true
   warmup_epochs: 20     # Stage 1 boundary (Twarm)
   transition_epochs: 50 # Stage 2 boundary
   initial_complexity: 0.2
-  initial_temperature: 10.0
+  initial_temperature: 10.0 # legacy_multiply only
   lambda_smooth: 0.1
 
 # Knowledge distillation

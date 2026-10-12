@@ -32,10 +32,15 @@ quantization:
   grid_size: 8          # tiles per spatial dimension (paper Sec IV-D)
   bit_mapping: mlp      # 'mlp' (Eq.13-17) | 'linear' (paper's ablation)
   normalize_complexity: false  # per-image percentile-normalize C before mapping
+  allocation_policy: adaptive # adaptive | uniform | shuffle | layerwise | std
+  smooth_transitions: true # learned gate; false sets m(p)=1
 
 # Curriculum learning (3-stage schedule, paper Fig.3 / Algorithm 3)
 curriculum:
   enabled: true
+  schedule_mode: interpolate # corrected default; legacy_multiply reproduces the old schedule
+  sample_enabled: true
+  precision_enabled: true
   score_backend: train  # 'train' (default: same metric backend the training
                         # hooks use — single source of truth for the
                         # curriculum signal) | 'gpu' | 'cv2' (exact Eq.21-24
@@ -45,7 +50,7 @@ curriculum:
   warmup_epochs: 20     # Stage 1 boundary (paper Table X: Twarm = 20)
   transition_epochs: 50 # Stage 2 boundary (paper Fig.3)
   initial_complexity: 0.2
-  initial_temperature: 10.0
+  initial_temperature: 10.0 # used only by legacy_multiply
   lambda_smooth: 0.1    # Table X lambda2; scale down for finer grids
 
 # Knowledge distillation

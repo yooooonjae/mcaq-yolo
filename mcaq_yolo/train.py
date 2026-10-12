@@ -8,6 +8,8 @@ MCAQ-YOLO Training Module
 from __future__ import annotations
 
 import argparse
+import json
+import copy
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,6 +34,7 @@ from .core.curriculum import CurriculumScheduler
 from .utils.dataset import compute_dataset_complexity
 from .utils.evaluation import compute_map, extract_targets_per_image, _decode_outputs
 from .utils.repro import set_global_seed
+from .utils.bit_diagnostics import BitDiagnostics
 
 
 class Trainer:
@@ -44,7 +47,8 @@ class Trainer:
     """
 
     def __init__(self, config: Dict[str, Any]):
-        self.config = config
+        self.config = copy.deepcopy(config)
+        config = self.config
 
         # REVIEW FIX (reproducibility): fix all RNGs BEFORE any stochastic
         # construction (weight init of the complexity/bit-mapping MLPs,
@@ -91,6 +95,7 @@ class Trainer:
 
         print(f"[MCAQ] Loaded teacher model from {teacher_abs}")
         self.teacher_model = YOLO(teacher_abs).to(self.device)
+        config.setdefault('model', {})['teacher_path'] = teacher_abs
         self.teacher_model.eval()  # for KD
 
         # --------------------------
@@ -106,15 +111,24 @@ class Trainer:
         model_kwargs = dict(
             model_name=model_cfg.get("name", "yolov8n"),
             num_classes=num_classes,
+            pretrained=bool(model_cfg.get('pretrained', True)),
             device=str(self.device),
+            control_seed=int(config.get('seed', 0) or 0),
         )
         # Quantization settings (Table X defaults follow the MCAQYOLO-side defaults)
         for key in ("min_bits", "max_bits", "target_bits", "grid_size",
-                    "bit_mapping", "normalize_complexity"):
+                    "bit_mapping", "normalize_complexity", "allocation_policy", "smooth_transitions"):
             if key in quant_cfg:
                 model_kwargs[key] = quant_cfg[key]
 
         self.model = MCAQYOLO(**model_kwargs).to(self.device)
+        loaded_path = getattr(self.model._yolo_wrapper, 'ckpt_path', None)
+        if loaded_path and Path(loaded_path).is_file():
+            config['model']['name'] = str(Path(loaded_path).resolve())
+        # Gate-off omits randomly initialized gate layers. Reset after model
+        # construction so this control does not also change data/augmentation RNG.
+        if seed is not None:
+            set_global_seed(int(seed), deterministic=bool(config.get('deterministic', False)))
 
         # --------------------------
         # Dataset / Dataloader
@@ -213,6 +227,14 @@ class Trainer:
             initial_complexity=float(self.curriculum_cfg.get("initial_complexity", 0.2)),
             initial_temperature=float(self.curriculum_cfg.get("initial_temperature", 10.0)),
             lambda_smooth=float(self.curriculum_cfg.get("lambda_smooth", 0.1)),
+            initial_bits=float(self.model.max_bits),
+            target_bits=float(self.model.target_bits),
+            min_bits=float(self.model.min_bits),
+            schedule_mode=self.curriculum_cfg.get('schedule_mode', 'interpolate'),
+            sample_enabled=bool(self.curriculum_cfg.get('enabled', True)
+                                and self.curriculum_cfg.get('sample_enabled', True)),
+            precision_enabled=bool(self.curriculum_cfg.get('enabled', True)
+                                   and self.curriculum_cfg.get('precision_enabled', True)),
         )
 
         # Raw teacher nn.Module (the YOLO wrapper post-processes outputs; KD needs
@@ -263,6 +285,9 @@ class Trainer:
                 if key in base:
                     base[key] = val
 
+        # Explicit run settings must not be replaced by defaults in a teacher checkpoint.
+        base.update(imgsz=self.imgsz, batch=self.batch_size, workers=self.num_workers,
+                    device=str(self.device))
         return SimpleNamespace(**base)
 
     def _resolve_data_yaml(self) -> Tuple[str, Dict[str, Any]]:
@@ -307,8 +332,8 @@ class Trainer:
         cfg_ns = self._build_ultra_cfg()
 
         data_cfg = self.data_cfg
-        train_img_rel = data_cfg.get("train", None)
-        val_img_rel = data_cfg.get("val", None)
+        train_img_rel = data_cfg.get("train", data_dict.get('train'))
+        val_img_rel = data_cfg.get("val", data_dict.get('val'))
 
         if train_img_rel is None or val_img_rel is None:
             raise ValueError(
@@ -317,7 +342,7 @@ class Trainer:
             )
 
         # Build absolute paths from data_dict['path']
-        dataset_root = data_dict.get("path", "")
+        dataset_root = data_dict.get("path", str(Path(yaml_path).parent))
         train_img_path = os.path.join(dataset_root, train_img_rel)
         val_img_path = os.path.join(dataset_root, val_img_rel)
 
@@ -565,6 +590,7 @@ class Trainer:
         total_smooth_loss = 0.0
         total_avg_bits = 0.0
         bit_counts = {2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0, 8: 0}
+        diagnostics = BitDiagnostics(self.model.max_bits)
         n_batches = 0
 
         # Create progress bar
@@ -588,7 +614,9 @@ class Trainer:
             with autocast("cuda", enabled=self.use_amp):
                 # student model forward (includes complexity + bit allocation;
                 # in Stage 1 quantize=False for the high-precision warm-up)
-                outputs, aux_info = self.model(imgs, temp, quantize=quantize)
+                outputs, aux_info = self.model(
+                    imgs, temp, quantize=quantize,
+                    precision_progress=self.curriculum.model_precision_progress(epoch))
 
                 # FP32 teacher raw outputs for KD (paper Eq.20: L includes
                 # lambda3 * LKD — composed inside the loss, not alpha-blended).
@@ -652,6 +680,7 @@ class Trainer:
             total_bit_loss += loss_dict.get('loss_bit', torch.tensor(0.0)).detach().item() if isinstance(loss_dict.get('loss_bit'), torch.Tensor) else loss_dict.get('loss_bit', 0.0)
             total_smooth_loss += loss_dict.get('loss_smooth', torch.tensor(0.0)).detach().item() if isinstance(loss_dict.get('loss_smooth'), torch.Tensor) else loss_dict.get('loss_smooth', 0.0)
 
+            diagnostics.update(aux_info)
             # Track bit allocation
             avg_bits = aux_info.get('avg_bits', 0.0)
             if isinstance(avg_bits, torch.Tensor):
@@ -712,12 +741,15 @@ class Trainer:
             "bit_loss": avg_bit_loss,
             "smooth_loss": avg_smooth_loss,
             "avg_bits": avg_bits,
-            "temperature": temp
+            "temperature": temp,
+            "bit_diagnostics": diagnostics.result(target_bits_t),
+            "samples": len(epoch_loader.sampler),
         }
 
     @torch.no_grad()
     def evaluate(self, quantize: bool = True, temperature: float = 1.0,
-                 compute_map_metric: bool = True) -> Dict[str, float]:
+                 compute_map_metric: bool = True, precision_progress=None,
+                 target_bits=None, paired_shuffle=False) -> Dict[str, float]:
         """
         Validation loop: val_loss on every call, plus mAP@0.5 (used for
         best-checkpoint selection) when compute_map_metric is True.
@@ -742,6 +774,7 @@ class Trainer:
         total_loss = 0.0
         n_batches = 0
         all_dets, all_tgts = [], []
+        diagnostics = BitDiagnostics(self.model.max_bits)
 
         for batch in self.val_loader:
             imgs = batch["img"].to(self.device, non_blocking=True)
@@ -752,7 +785,13 @@ class Trainer:
                 imgs = imgs.float()
 
             with autocast("cuda", enabled=self.use_amp):
-                outputs, aux_info = self.model(imgs, temperature=temperature, quantize=quantize)
+                if paired_shuffle:
+                    if not quantize or temperature != 1. or precision_progress not in (None, 1.):
+                        raise ValueError('paired shuffle requires the endpoint inference policy')
+                    _, (outputs, aux_info) = self.model.paired_shuffle_forward(imgs)
+                else:
+                    outputs, aux_info = self.model(imgs, temperature=temperature, quantize=quantize,
+                                                  precision_progress=precision_progress)
                 loss, loss_dict = self.model.loss_fn(
                     outputs,
                     batch,
@@ -761,6 +800,7 @@ class Trainer:
                 )
                 loss_det = loss_dict.get('loss_det', loss)
 
+            diagnostics.update(aux_info)
             total_loss += loss_det.detach().item()
             n_batches += 1
 
@@ -778,7 +818,8 @@ class Trainer:
         avg_loss = total_loss / max(1, n_batches)
         map50 = (compute_map(all_dets, all_tgts, iou_thresholds=[0.5])["mAP@0.5"]
                  if compute_map_metric else None)
-        return {"val_loss": avg_loss, "mAP50": map50}
+        return {"val_loss": avg_loss, "mAP50": map50,
+                "bit_diagnostics": diagnostics.result(self.model.target_bits if target_bits is None else target_bits)}
 
     # ------------------------------------------------------------------
     # Public API
@@ -790,7 +831,16 @@ class Trainer:
         print(f"Starting training for {self.epochs} epochs...")
         print(f"Output directory: {self.output_dir}")
 
+        from .experiments import write_manifest, file_hash
+        history_path = self.output_dir / 'history.jsonl'
+        if history_path.exists():
+            raise FileExistsError(f'{history_path} already exists; use a fresh output directory')
+        write_manifest(self.config, self.output_dir, self.model,
+                       {'train': self.train_dataset, 'val': self.val_dataset})
+        (self.output_dir / 'resolved_config.yaml').write_text(
+            yaml.safe_dump(self.config, sort_keys=False), encoding='utf-8')
         best_map = -1.0
+        best_epoch = None
         best_weights_path = self.output_dir / "best.pt"
         last_weights_path = self.output_dir / "last.pt"
 
@@ -802,11 +852,26 @@ class Trainer:
             # mAP cadence: every training.map_interval epochs (always on the
             # final epoch so short runs still report a number)
             want_map = (epoch % self.map_interval == 0) or (epoch == self.epochs)
+            selection_eligible = stage >= 3 or self.curriculum.model_precision_progress(epoch) == 1.
             val_metrics = self.evaluate(
                 quantize=stage >= 2,
                 temperature=self._get_curriculum_temperature(epoch),
                 compute_map_metric=want_map,
+                precision_progress=self.curriculum.model_precision_progress(epoch),
+                target_bits=self.curriculum.get_target_bits(epoch),
             )
+            selection_metrics = val_metrics
+            if (selection_eligible and want_map and self.curriculum.schedule_mode == 'legacy_multiply'
+                    and self.curriculum.precision_enabled):
+                # Legacy training never reaches multiplier=1 exactly. Select
+                # all candidate checkpoints by the same endpoint inference mode.
+                selection_metrics = self.evaluate(precision_progress=1.)
+            with history_path.open('a', encoding='utf-8') as stream:
+                stream.write(json.dumps(dict(epoch=epoch, stage=stage,
+                    precision_progress=self.curriculum.model_precision_progress(epoch),
+                    quantize=stage >= 2, target_bits=self.curriculum.get_target_bits(epoch),
+                    train=train_metrics, validation=val_metrics,
+                    selection_validation=selection_metrics)) + '\n')
 
             if self.scheduler is not None:
                 self.scheduler.step()
@@ -829,9 +894,10 @@ class Trainer:
             # pinned to the FP warm-up checkpoint forever. Now best is chosen by
             # the peak mAP@0.5 of the 'fully-quantized Stage 3' (a detection
             # model's best should be by AP, not by loss).
-            if (stage >= 3 and val_metrics["mAP50"] is not None
-                    and val_metrics["mAP50"] > best_map):
-                best_map = val_metrics["mAP50"]
+            if (selection_eligible and selection_metrics["mAP50"] is not None
+                    and selection_metrics["mAP50"] > best_map):
+                best_map = selection_metrics["mAP50"]
+                best_epoch = epoch
                 torch.save(self.model.state_dict(), best_weights_path)
 
         if best_map < 0:
@@ -842,6 +908,19 @@ class Trainer:
         else:
             print(f"[MCAQ] Training finished. Best quantized mAP@0.5={best_map:.4f}")
         print(f"[MCAQ] Best weights saved to {best_weights_path}")
+
+        self.model.load_state_dict(torch.load(best_weights_path, map_location=self.device, weights_only=True))
+        endpoint_metrics = self.evaluate(quantize=True, temperature=1., precision_progress=1.)
+        result = dict(selected_epoch=best_epoch or self.epochs,
+                      final_policy_trained=(self.curriculum.model_precision_progress(self.epochs) == 1.),
+                      schedule_completed=(self.epochs >= (self.epochs if self.curriculum.schedule_mode == 'legacy_multiply'
+                                          else self.curriculum.transition_epochs)
+                                          or not self.curriculum.precision_enabled),
+                      selection_policy='integer_endpoint',
+                      selection_mAP50=best_map if best_epoch is not None else None,
+                      evaluation=endpoint_metrics, checkpoint_sha256=file_hash(best_weights_path),
+                      backend='floating_point_qdq', weights='floating_point')
+        (self.output_dir / 'result.json').write_text(json.dumps(result, indent=2), encoding='utf-8')
 
         return self.model
 

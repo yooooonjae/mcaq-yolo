@@ -78,6 +78,12 @@ class Predictor:
         # Load checkpoint
         checkpoint = torch.load(model_path, map_location=self.device)
         
+        # Trainer stores the policy beside its state_dict. Reuse it by default;
+        # parameters alone cannot distinguish adaptive/uniform/shuffled policies.
+        if config_path is None:
+            companion = Path(model_path).with_name('resolved_config.yaml')
+            if companion.is_file():
+                config_path = str(companion)
         # Get configuration
         if config_path:
             import yaml
@@ -95,6 +101,10 @@ class Predictor:
             target_bits=config.get('quantization', {}).get('target_bits', 4),
             grid_size=config.get('quantization', {}).get('grid_size', 8),
             bit_mapping=config.get('quantization', {}).get('bit_mapping', 'mlp'),
+            normalize_complexity=config.get('quantization', {}).get('normalize_complexity', False),
+            allocation_policy=config.get('quantization', {}).get('allocation_policy', 'adaptive'),
+            smooth_transitions=config.get('quantization', {}).get('smooth_transitions', True),
+            control_seed=int(config.get('seed', 0) or 0),
             device=str(self.device)
         )
         
@@ -102,6 +112,10 @@ class Predictor:
         # for checkpoints from older code revisions (parameter names changed
         # across the paper-alignment refactor), with an explicit warning.
         state = checkpoint.get('model_state_dict', checkpoint)
+        if config.get('quantization', {}).get('allocation_policy') is not None:
+            # New controlled runs must never silently load random/missing gates.
+            model.load_state_dict(state, strict=True)
+            return model.to(self.device)
         try:
             model.load_state_dict(state)
         except RuntimeError as e:

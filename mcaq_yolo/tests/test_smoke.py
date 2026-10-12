@@ -140,7 +140,8 @@ def test_calibration_freeze():
 # ---------------------------------------------------------------------------
 
 def test_curriculum_schedule():
-    cs = CurriculumScheduler(warmup_epochs=20, transition_epochs=50, total_epochs=300)
+    cs = CurriculumScheduler(warmup_epochs=20, transition_epochs=50, total_epochs=300,
+                             schedule_mode='legacy_multiply')
     assert cs.get_stage(1) == 1 and cs.get_stage(20) == 1
     assert cs.get_stage(21) == 2 and cs.get_stage(50) == 2
     assert cs.get_stage(51) == 3
