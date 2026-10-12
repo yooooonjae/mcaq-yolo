@@ -38,22 +38,14 @@ __global__ void SpatialAdaptiveQuantizationKernel(
     int c = (int)((idx / ((long long)width * height)) % channels);
     int n = (int)(idx / ((long long)width * height * channels));
 
-    // 1. Look up the bit-width for this pixel.
-    // bit_map is a downsampled tile grid, so an index conversion is needed.
-    // The grid size is NOT recomputed as height/tile_h; the actual bit_map
-    // size (n_tiles_h/w) is used directly — since tile_h = floor(H / Ht), if H
-    // is not divisible by Ht the recomputed grid is larger than the real one
-    // and goes OOB (e.g. H=10, Ht=4 -> tile_h=2 -> 10/2=5 > 4; from external
-    // review). Remainder pixels are assigned to the last tile.
-    int tile_idx_h = h / tile_h;
-    int tile_idx_w = w / tile_w;
-    if (tile_idx_h >= n_tiles_h) tile_idx_h = n_tiles_h - 1;
-    if (tile_idx_w >= n_tiles_w) tile_idx_w = n_tiles_w - 1;
-
-    int map_idx = n * (n_tiles_h * n_tiles_w) + tile_idx_h * n_tiles_w + tile_idx_w;
+    // Same partition as F.interpolate(..., mode="nearest"), including
+    // non-divisible sizes and maps larger than the feature map.
+    int tile_idx_h = (int)(((long long)h * n_tiles_h) / height);
+    int tile_idx_w = (int)(((long long)w * n_tiles_w) / width);
+    long long map_idx = ((long long)n * n_tiles_h + tile_idx_h) * n_tiles_w + tile_idx_w;
 
     float bits_float = bit_map[map_idx];
-    int bits = (int)(bits_float + 0.5f); // Round
+    int bits = (int)nearbyintf(bits_float); // ties-to-even, like torch.round
 
     // clamp bit range (2 ~ 8)
     if (bits < 2) bits = 2;
@@ -65,14 +57,14 @@ __global__ void SpatialAdaptiveQuantizationKernel(
     float qmin = -(powf(2.0f, bits - 1));
     float qmax = powf(2.0f, bits - 1) - 1.0f;
 
-    float x_min = min_vals[c]; // Per-channel (the caller guarantees C entries)
-    float x_max = max_vals[c];
+    float x_min = fminf(min_vals[c], 0.0f);
+    float x_max = fmaxf(max_vals[c], 0.0f);
 
     // compute scale
     float range = x_max - x_min;
     if (range < 1e-8f) range = 1e-8f;
     float scale = range / (qmax - qmin);
-    float zero_point = qmin - x_min / scale;
+    float zero_point = nearbyintf(qmin - x_min / scale);
 
     // Clamp Zero Point
     if (zero_point < qmin) zero_point = qmin;
@@ -80,7 +72,7 @@ __global__ void SpatialAdaptiveQuantizationKernel(
 
     // 3. Quantize & Dequantize (Simulated)
     float val = input[idx];
-    float q_val = roundf(val / scale + zero_point);
+    float q_val = nearbyintf(val / scale + zero_point);
 
     if (q_val < qmin) q_val = qmin;
     if (q_val > qmax) q_val = qmax;

@@ -60,7 +60,8 @@ mcaq-yolo-train \
     --output-dir outputs/experiment_1
 ```
 
-The best weights (lowest validation loss) are saved to `<output_dir>/best.pt`.
+The best weights (highest quantized Stage-3 validation mAP@0.5) are saved to
+`<output_dir>/best.pt`. Runs ending before Stage 3 save the final model instead.
 
 ### Inference
 ```bash
@@ -79,8 +80,8 @@ mcaq-yolo-infer \
 
 ### Tests
 ```bash
-# From the repo root (CPU-friendly smoke tests)
-python -m pytest mcaq_yolo/tests/test_smoke.py -v
+# From the repo root (CPU-friendly tests; CUDA tests require the extension)
+python -m pytest -v
 ```
 
 ## 📊 Model Architecture
@@ -238,6 +239,54 @@ python -m mcaq_yolo.scripts.m4_variation_gain \
     --ckpt-uniform outputs/<uniform>/best.pt \
     --data <dataset.yaml> --val-rel images/val
 ```
+
+### Precomputed-map inference
+
+The default forward pass computes morphology from the C3/C4/C5 feature maps.
+For repeated inference on an already known, identically preprocessed input,
+the model can explicitly consume precomputed per-scale maps:
+
+```python
+model.eval()
+model.calibrate(calibration_loader, num_images=1000)
+bit_maps = model.precompute_bit_maps(images)
+# Optional persistence: torch.save([b.cpu() for b in bit_maps], "bit_maps.pt")
+with torch.inference_mode():
+    predictions, aux = model(images, precomputed_bit_maps=bit_maps)
+```
+
+`images` is the preprocessed NCHW tensor used to compute the maps. Regenerate
+maps after changing the input, batch ordering, preprocessing, weights or
+calibration. This API skips morphology and bit mapping; the learned soft mask
+still uses the current activations. It rejects training, non-unit temperature,
+missing scales and invalid bit values. `aux['complexity_map']` contains `None`
+for each scale on this path. It does not implicitly reuse maps on novel images
+or implement the paper's approximate streaming LSH cache.
+
+### Spatial quantization corrections
+
+- `grid_size=8` now means eight tiles along each spatial axis, capped by the
+  feature dimensions for tiny maps. Both morphology backends retain all border
+  pixels and use the same proportional partition as nearest-neighbor bit-map
+  upsampling. Dyadic box counting operates inside rectangular tiles and includes
+  partial boundary boxes; tiles smaller than four pixels along either axis use
+  the documented fractal fallback of 1.
+- Affine quantization includes zero in the calibration range and uses an integer
+  zero point. Constant positive/negative channels no longer collapse to zero.
+- CUDA uses the same tile ownership and ties-to-even rounding as PyTorch. The
+  wrapper supplies float32 kernel inputs and restores the activation dtype;
+  non-minmax calibration and learned rounding retain the PyTorch path.
+- Recalibration resets frozen statistics, respects the image limit and restores
+  mixed train/eval modes. Saved calibration histograms now load correctly.
+- These corrections change numerical behavior relative to v0.2.2. Existing
+  checkpoints can load, but their grids, calibration and outputs must not be
+  treated as numerically identical. Curriculum scores from the old layout are
+  invalidated automatically. Regenerate precomputed maps and recalibrate when
+  migrating; evaluate the changed implementation before comparing experiments.
+
+The regression suite checks numerical behavior and detector integration; it
+does not remeasure the paper's accuracy, compressed size or FPS. The CUDA and
+TensorRT paths still need a compatible build/runtime for hardware validation.
 
 ## 📁 Project Structure
 ```

@@ -424,13 +424,19 @@ class Trainer:
 
         train_files = [str(Path(p).resolve()) for p in self.train_dataset.im_files]
         files_md5 = hashlib.md5("\n".join(train_files).encode()).hexdigest()
+        analyzer = self.model.complexity_analyzer
         meta = {
-            "version": 2,
+            "version": 3,  # exact proportional grids and tile-local morphology
             "augment": False,
             "backend": effective_backend,
             "imgsz": self.imgsz,
             "n": len(train_files),
             "files_md5": files_md5,
+            "grid_size": analyzer.grid_size,
+            "canny_impl": analyzer.canny_impl,
+            "binarize_impl": analyzer.binarize_impl,
+            "contour_components": analyzer.contour_components,
+            "feature_weights": analyzer.feature_weights.detach().cpu().tolist(),
         }
         meta_path = self.complexity_path.with_suffix(".meta.json")
 
@@ -444,7 +450,7 @@ class Trainer:
                 scores_np = np.load(self.complexity_path)
                 return torch.from_numpy(scores_np).float().to(self.device)
             print("[MCAQ] Cached complexity scores are stale "
-                  "(backend/imgsz/file-list changed) — recomputing.")
+                  "(morphology settings, image size or files changed) — recomputing.")
 
         print("[MCAQ] Computing complexity scores for curriculum learning "
               f"(augment-free, backend={effective_backend})...")

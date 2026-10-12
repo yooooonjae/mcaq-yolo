@@ -414,32 +414,22 @@ class MCAQYOLO(nn.Module):
                 return None
 
             feat = output
-            # Complexity (phi: no_grad side-info; MLP learnable — Algorithm 1).
-            # IMPLEMENTATION ASSUMPTION (review point): the morphological
-            # metrics run on the channel-mean of the C3/C4/C5 FEATURE map, not
-            # on the input image — the paper describes image-domain morphology
-            # at calibration time (0.3ms overhead), whereas this per-forward
-            # feature-domain computation is a different operator and does not
-            # reproduce the paper's latency path. Feature-vs-image complexity
-            # correlation has not been measured here; treat per-scale
-            # complexity maps as feature-domain quantities.
-            complexity = self.complexity_analyzer(feat)
-            if self.normalize_complexity:
-                B = complexity.shape[0]
-                flat = complexity.reshape(B, -1)
-                lo = torch.quantile(flat, 0.02, dim=1, keepdim=True).unsqueeze(-1)
-                hi = torch.quantile(flat, 0.98, dim=1, keepdim=True).unsqueeze(-1)
-                complexity = ((complexity - lo) / (hi - lo + 1e-8)).clamp(0.0, 1.0)
-            # Bit allocation (Eq.13-17, temperature per Algorithm 3 line 13).
-            # During training the bit map stays CONTINUOUS so the fractional-bit
-            # quantizer makes Ldet/LKD differentiable w.r.t. the mapping network
-            # (paper: gradients propagate through the mapping network and the
-            # quantization operator via STE); at inference bits are integers.
-            bit_map = self.bit_mapper(
-                complexity,
-                state.get('temperature', 1.0),
-                return_continuous=self.training,
-            )
+            precomputed = state.get('precomputed_bit_maps')
+            if precomputed is not None:
+                complexity = None  # deliberately not recomputed on this path
+                bit_map = precomputed[layer_idx].to(device=feat.device, dtype=torch.float32)
+            else:
+                complexity = self.complexity_analyzer(feat)
+                if self.normalize_complexity:
+                    B = complexity.shape[0]
+                    flat = complexity.reshape(B, -1)
+                    lo = torch.quantile(flat, 0.02, dim=1, keepdim=True).unsqueeze(-1)
+                    hi = torch.quantile(flat, 0.98, dim=1, keepdim=True).unsqueeze(-1)
+                    complexity = ((complexity - lo) / (hi - lo + 1e-8)).clamp(0.0, 1.0)
+                bit_map = self.bit_mapper(
+                    complexity, state.get('temperature', 1.0),
+                    return_continuous=self.training,
+                )
 
             quantize = state.get('quantize', True)
             quantizer = self.quantizers[str(layer_idx)]
@@ -473,39 +463,61 @@ class MCAQYOLO(nn.Module):
                 )
 
     @torch.no_grad()
+    def precompute_bit_maps(self, x: torch.Tensor) -> List[torch.Tensor]:
+        """Compute detached per-scale maps for this exact preprocessed input.
+
+        Call after calibration in eval mode. The maps are valid for the same
+        input, model weights, calibration and preprocessing only. There is no
+        implicit cache or reuse on novel images.
+        """
+        if self.training:
+            raise ValueError("precomputed bit maps are an inference-only path; call eval()")
+        _, aux = self(x, temperature=1.0)
+        return [bits.detach().clone() for bits in aux['bit_map']]
+
+    @torch.no_grad()
     def calibrate(self, dataloader, num_images: int = 1000):
+        """Refresh EMA statistics on at most num_images, then freeze them.
+
+        Repeated calls start a new calibration run, including when an earlier
+        run froze the buffers. The caller's train/eval mode is restored.
         """
-        Calibration protocol (paper Sec IV-D / Table X): collect per-channel
-        min/max statistics with EMA momentum 0.99 over 1,000 calibration images,
-        then freeze them so inference uses fixed scale/zero-point per channel.
-        """
+        if not isinstance(num_images, int) or num_images <= 0:
+            raise ValueError("num_images must be a positive integer")
+        training_modes = {module: module.training for module in self.modules()}
         self.eval()
-        seen = 0
-        for batch in dataloader:
-            imgs = batch['img'] if isinstance(batch, dict) else batch[0]
-            imgs = imgs.to(self.device).float()
-            if imgs.max() > 1.5:
-                imgs = imgs / 255.0
-
-            self._mcaq_state = {
-                'active': True,
-                'temperature': 1.0,
-                'quantize': True,
-                'calibrating': True,  # hooks run quantizers in stats-update mode
-                'aux': [],
-            }
-            try:
-                self.model(imgs)
-            finally:
-                self._mcaq_state = {'active': False}
-
-            seen += imgs.shape[0]
-            if seen >= num_images:
-                break
-
         for q in self.quantizers.values():
-            q.freeze_calibration()
-        print(f"[MCAQ] Calibration frozen after {seen} images.")
+            q.reset_calibration()
+        seen = 0
+        try:
+            for batch in dataloader:
+                if torch.is_tensor(batch):
+                    imgs = batch
+                else:
+                    imgs = batch['img'] if isinstance(batch, dict) else batch[0]
+                imgs = imgs[:num_images - seen].to(next(self.parameters()).device).float()
+                if imgs.numel() == 0:
+                    continue
+                if imgs.max() > 1.5:
+                    imgs = imgs / 255.0
+                self._mcaq_state = {
+                    'active': True, 'temperature': 1.0, 'quantize': True,
+                    'calibrating': True, 'aux': [],
+                }
+                self.model(imgs)
+                seen += imgs.shape[0]
+                if seen >= num_images:
+                    break
+            if seen == 0:
+                raise ValueError("cannot calibrate on an empty dataloader")
+            for q in self.quantizers.values():
+                q.freeze_calibration()
+        finally:
+            self._mcaq_state = {'active': False}
+            # Preserve mixed modes, e.g. an eval-only teacher or frozen BN.
+            for module, mode in training_modes.items():
+                module.training = mode
+        return seen
 
     def setup_teacher(self):
         """Setup teacher model for distillation."""
@@ -530,7 +542,8 @@ class MCAQYOLO(nn.Module):
         temperature: float = 1.0,
         return_aux: bool = True,
         targets: Optional[Dict] = None,
-        quantize: bool = True
+        quantize: bool = True,
+        precomputed_bit_maps: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, Optional[Dict]]:
         """
         Forward pass with adaptive quantization.
@@ -545,6 +558,9 @@ class MCAQYOLO(nn.Module):
             temperature: alpha_t for bit allocation (Algorithm 3)
             return_aux: Whether to return auxiliary information
             targets: Target labels for training
+            precomputed_bit_maps: Optional integer maps in backbone_out_indices order.
+                Inference only; must correspond to this exact input/model/calibration.
+                Skips morphology and mapping; complexity_map entries are then None.
             quantize: If False (curriculum Stage 1 warm-up, paper Fig.3), skip the
                 quantization step (high precision) while still producing complexity
                 and bit maps so Lbit/Lsmooth keep training the mapping networks.
@@ -553,11 +569,27 @@ class MCAQYOLO(nn.Module):
             outputs: Detection outputs
             aux_info: Auxiliary information (if return_aux=True)
         """
+        prepared_maps = None
+        if precomputed_bit_maps is not None:
+            if self.training or not quantize or temperature != 1.0:
+                raise ValueError("precomputed maps require quantized inference at temperature=1")
+            if len(precomputed_bit_maps) != len(self.backbone_out_indices):
+                raise ValueError("precomputed_bit_maps must contain one map per backbone scale")
+            prepared_maps = {}
+            for layer, bits in zip(self.backbone_out_indices, precomputed_bit_maps):
+                if (not torch.is_tensor(bits) or bits.dim() != 3
+                        or bits.shape[0] != x.shape[0] or any(n == 0 for n in bits.shape)):
+                    raise ValueError("each precomputed bit_map must be nonempty (B,Ht,Wt)")
+                if not bool(torch.isfinite(bits).all() & (bits >= 2).all()
+                            & (bits <= 8).all() & (bits == bits.round()).all()):
+                    raise ValueError("precomputed bit_map values must be integers in [2,8]")
+                prepared_maps[layer] = bits.detach()
         self._mcaq_state = {
             'active': True,
             'temperature': temperature,
             'quantize': quantize,
             'aux': [],
+            'precomputed_bit_maps': prepared_maps,
         }
         try:
             outputs = self.model(x)

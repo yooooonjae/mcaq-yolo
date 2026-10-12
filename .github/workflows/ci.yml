@@ -26,5 +26,5 @@ jobs:
 
       # CPU runner: the CUDA kernel parity test self-skips; the end-to-end
       # test downloads yolov8n.pt (~6 MB) on first run.
-      - name: Run smoke tests
-        run: python -m pytest mcaq_yolo/tests/test_smoke.py -v
+      - name: Run test suite
+        run: python -m pytest -v

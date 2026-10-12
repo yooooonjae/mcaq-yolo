@@ -53,6 +53,8 @@ class MorphologicalComplexityAnalyzer(nn.Module):
                         per-contour Eq.24). Documented approximation.
         """
         super().__init__()
+        if not isinstance(grid_size, int) or grid_size < 1:
+            raise ValueError("grid_size must be a positive integer")
         self.grid_size = grid_size
         self.device = device
         self.metric_backend = metric_backend
@@ -69,7 +71,7 @@ class MorphologicalComplexityAnalyzer(nn.Module):
         # was never read or written, which misleadingly implied the feature).
         # The vectorized GPU path recomputes per batch instead.
 
-        # Algorithm 1 line 14-15: phi = [phi1..phi5, phi1*phi2, phi3^2, phi4*phi5]; C <- MLP(phi)
+        # Algorithm 1 line 14-15: phi = [phi1..phi5, phi1*phi2, phi3^2, sqrt(phi4*phi5)]; C <- MLP(phi)
         # The 8-D feature already carries the Eq.(9) interaction terms (beta12, beta33, beta45
         # are absorbed as learnable weights of this MLP) — do NOT add a separate interaction
         # module on top, that would double-count Eq.(9).
@@ -127,19 +129,13 @@ class MorphologicalComplexityAnalyzer(nn.Module):
         counts = []
 
         for s in scales:
-            # Downsample using pooling-like resize
-            h_new, w_new = h // s, w // s
-            if h_new <= 0 or w_new <= 0:
-                continue
-
-            pooled = cv2.resize(
-                edge_map.astype(np.float32),
-                (w_new, h_new),
-                interpolation=cv2.INTER_AREA,  # valid constant
-            )
-            n_boxes = np.sum(pooled > 0)
-            if n_boxes > 0:
-                counts.append((s, n_boxes))
+            # Dyadic occupancy, including partial boundary boxes. Area resize
+            # changes box widths for non-divisible tiles and disagrees with
+            # max pooling; pad only the incomplete boxes with background.
+            padded = np.pad(edge_map, ((0, (-h) % s), (0, (-w) % s)))
+            occupied = padded.reshape(padded.shape[0] // s, s,
+                                      padded.shape[1] // s, s).max(axis=(1, 3))
+            counts.append((s, np.count_nonzero(occupied)))
 
         if len(counts) < 2:
             return 1.0
@@ -150,11 +146,11 @@ class MorphologicalComplexityAnalyzer(nn.Module):
         log_scales = np.log(scales_arr)
         log_counts = np.log(counts_arr + 1)
 
-        # Apply exponential weights (recent scales more important)
+        # Weighted least squares; np.polyfit squares its supplied weights.
         weights = np.exp(-0.1 * np.arange(len(scales_arr)))
 
         # Calculate fractal dimension via weighted regression
-        coef = np.polyfit(log_scales, log_counts, 1, w=weights)[0]
+        coef = np.polyfit(log_scales, log_counts, 1, w=np.sqrt(weights))[0]
         df = -coef
 
         return float(np.clip(df, 1.0, 2.0))
@@ -356,24 +352,14 @@ class MorphologicalComplexityAnalyzer(nn.Module):
     # ------------------------------------------------------------------
     # GPU tile-wise metric helpers (vectorized; deterministic side-information)
     # ------------------------------------------------------------------
-    def _tile_size(self, H: int) -> int:
-        """
-        Tile size for an HxH map: largest power of two <= max(4, H // grid_size).
+    def _grid_bounds(self, length: int):
+        """Non-overlapping tiles matching nearest upsampling: floor(p*G/L).
 
-        Power-of-two tiles are required so the dyadic box-counting scales
-        (Algorithm 2) divide the tile exactly — non-power-of-two tiles produce
-        mismatched per-scale grids — and match Algorithm 1 line 1's
-        s in {16, 32, 64}. The floor of 4 guarantees at least two dyadic
-        scales for the fractal regression.
-
-        DOCUMENTED DEVIATION: the paper's tile-size statements conflict —
-        Sec IV-D/Eq.12 say "H/8 (8x8 grid)" while Algorithm 1 requires
-        power-of-two s and Table VIII defaults to 32. The pow2 floor follows
-        Algorithm 1; common sizes then give a 10x10 grid (e.g. 640 -> tile 64,
-        80 -> tile 8) rather than literally 8x8.
+        ceil(i*L/G) boundaries cover every pixel, including remainder borders.
+        Tiny features use one tile per pixel instead of empty tiles.
         """
-        raw = max(4, H // self.grid_size)
-        return 1 << (raw.bit_length() - 1)
+        count = min(self.grid_size, length)
+        return [(i * length + count - 1) // count for i in range(count + 1)]
 
     @staticmethod
     def _normalize01(x: torch.Tensor) -> torch.Tensor:
@@ -392,7 +378,9 @@ class MorphologicalComplexityAnalyzer(nn.Module):
         ky = torch.tensor(
             [[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32, device=dev
         ).view(1, 1, 3, 3)
-        return F.conv2d(gray, kx, padding=1), F.conv2d(gray, ky, padding=1)
+        mode = "reflect" if min(gray.shape[-2:]) > 1 else "replicate"
+        padded = F.pad(gray, (1, 1, 1, 1), mode=mode)
+        return F.conv2d(padded, kx), F.conv2d(padded, ky)
 
     @staticmethod
     def _otsu_threshold(x: torch.Tensor, bins: int = 256) -> torch.Tensor:
@@ -486,7 +474,8 @@ class MorphologicalComplexityAnalyzer(nn.Module):
         g1 = torch.exp(-(x1**2) / 2.0)
         g1 = g1 / g1.sum()
         g2 = (g1.unsqueeze(0) * g1.unsqueeze(1)).view(1, 1, 5, 5)
-        b01 = F.conv2d(gray, g2, padding=2)          # blurred, [0,1]
+        mode = "reflect" if min(gray.shape[-2:]) > 2 else "replicate"
+        b01 = F.conv2d(F.pad(gray, (2, 2, 2, 2), mode=mode), g2)
         b255 = b01 * 255.0
 
         # 3) Otsu on the blurred INTENSITY histogram -> threshold in 0..255
@@ -522,7 +511,8 @@ class MorphologicalComplexityAnalyzer(nn.Module):
         g1 = torch.exp(-(x1**2) / 2.0)
         g1 = g1 / g1.sum()
         g2 = (g1.unsqueeze(0) * g1.unsqueeze(1)).view(1, 1, 5, 5)
-        blurred = F.conv2d(gray, g2, padding=2)
+        mode = "reflect" if min(gray.shape[-2:]) > 2 else "replicate"
+        blurred = F.conv2d(F.pad(gray, (2, 2, 2, 2), mode=mode), g2)
 
         gx, gy = cls._sobel(blurred)
         mag = torch.sqrt(gx**2 + gy**2 + 1e-12)
@@ -556,10 +546,8 @@ class MorphologicalComplexityAnalyzer(nn.Module):
         cv2.getGaussianKernel's default sigma = 0.3*((k-1)*0.5 - 1) + 0.8
         (= 2.0 for k=11) and replicate borders (cv2's border mode).
 
-        DOCUMENTED RESIDUAL DIFFERENCE: the cv2 reference applies this
-        per-tile (replicate borders at every tile edge); here it runs on the
-        whole image, so tiles see true neighbors instead of artificial
-        borders — arguably better, but not bit-identical near tile edges.
+        Applied per tile with replicated borders, matching the reference
+        boundary convention. Tensor arithmetic remains floating point.
         """
         g255 = gray * 255.0
         k = block
@@ -580,25 +568,18 @@ class MorphologicalComplexityAnalyzer(nn.Module):
         clipped to [1,2].
         """
         B, _, Hc, Wc = edge.shape
-        ht, wt = Hc // tile, Wc // tile
-
-        # Dyadic scales within a tile: 2, 4, ..., tile (Algorithm 2 line 1)
-        scales = []
-        s = 2
-        while s <= tile:
-            scales.append(s)
-            s *= 2
+        th, tw = (tile, tile) if isinstance(tile, int) else tile
+        ht, wt = Hc // th, Wc // tw
+        patches = edge.unfold(2, th, th).unfold(3, tw, tw)
+        patches = patches.contiguous().reshape(B * ht * wt, 1, th, tw)
+        scales = [2 ** i for i in range(1, int(math.log2(min(th, tw))) + 1)]
         if len(scales) < 2:
-            # Too few scales for a regression — degenerate tile, return Df=1
             return torch.ones(B, ht, wt, device=edge.device)
-
         counts = []
-        for s in scales:
-            pooled = F.max_pool2d(edge, kernel_size=s, stride=s)  # box occupancy at scale s
-            k = tile // s
-            # Number of occupied boxes of size s inside each tile (Algorithm 2 line 5)
-            n_s = F.avg_pool2d(pooled, kernel_size=k, stride=k) * (k * k)
-            counts.append(n_s.squeeze(1))  # (B,ht,wt)
+        for scale in scales:
+            # Partial boxes at the right/bottom edge are occupied boxes too.
+            pooled = F.max_pool2d(patches, scale, scale, ceil_mode=True)
+            counts.append(pooled.sum(dim=(1, 2, 3)).reshape(B, ht, wt))
 
         n = torch.stack(counts, dim=0)  # (S,B,ht,wt)
         S = len(scales)
@@ -701,9 +682,10 @@ class MorphologicalComplexityAnalyzer(nn.Module):
         qd = onehot[:, [6, 9]].sum(dim=1, keepdim=True)
         e = (q1 - q3 - 2.0 * qd) / 4.0  # per-window Euler contribution
 
-        ht, wt = m.shape[-2] // tile, m.shape[-1] // tile
-        e = e[:, :, : ht * tile, : wt * tile]
-        K = F.avg_pool2d(e, kernel_size=tile, stride=tile) * (tile * tile)
+        th, tw = (tile, tile) if isinstance(tile, int) else tile
+        ht, wt = m.shape[-2] // th, m.shape[-1] // tw
+        e = e[:, :, : ht * th, : wt * tw]
+        K = F.avg_pool2d(e, kernel_size=tile, stride=tile) * (th * tw)
         return K.round().clamp(min=1.0)
 
     def _contour_complexity_tiles(self, binmask: torch.Tensor, tile: int) -> torch.Tensor:
@@ -726,8 +708,9 @@ class MorphologicalComplexityAnalyzer(nn.Module):
         eroded = -F.max_pool2d(-m, kernel_size=3, stride=1, padding=1)
         boundary = (m - eroded).clamp(min=0.0)
 
-        area = F.avg_pool2d(m, kernel_size=tile, stride=tile) * (tile * tile)
-        perim = F.avg_pool2d(boundary, kernel_size=tile, stride=tile) * (tile * tile)
+        th, tw = (tile, tile) if isinstance(tile, int) else tile
+        area = F.avg_pool2d(m, kernel_size=tile, stride=tile) * (th * tw)
+        perim = F.avg_pool2d(boundary, kernel_size=tile, stride=tile) * (th * tw)
 
         ic = (perim * perim) / (4.0 * math.pi * area + 1e-6)  # Eq.(24), K=1 form
         if self.contour_components:
@@ -746,8 +729,8 @@ class MorphologicalComplexityAnalyzer(nn.Module):
         analysis (the paper runs morphological analysis at calibration time).
         """
         B, C, H, W = features.shape
-        tile = self._tile_size(H)  # consistent grid with the GPU path
-        ht, wt = H // tile, W // tile
+        rows, cols = self._grid_bounds(H), self._grid_bounds(W)
+        ht, wt = len(rows) - 1, len(cols) - 1
 
         imgs = features.detach().float().cpu()
         gray_all = imgs.mean(dim=1)  # (B,H,W)
@@ -765,7 +748,7 @@ class MorphologicalComplexityAnalyzer(nn.Module):
 
             for i in range(ht):
                 for j in range(wt):
-                    t8 = g8[i * tile : (i + 1) * tile, j * tile : (j + 1) * tile]
+                    t8 = g8[rows[i]:rows[i + 1], cols[j]:cols[j + 1]]
 
                     # Edge map for phi1: Canny with Otsu-adaptive thresholds
                     blurred = cv2.GaussianBlur(t8, (5, 5), 1.0)
@@ -807,9 +790,11 @@ class MorphologicalComplexityAnalyzer(nn.Module):
             features: (B, C, H, W)
 
         Returns:
-            phi: (B, ht, wt, 8) tensor [phi1..phi5, phi1*phi2, phi3^2, phi4*phi5]
+            phi: (B, ht, wt, 8) tensor [phi1..phi5, phi1*phi2, phi3^2, sqrt(phi4*phi5)]
             detailed: dict of the 5 individual (B,ht,wt) metrics
         """
+        if features.dim() != 4 or any(n == 0 for n in features.shape):
+            raise ValueError("features must be a nonempty (B,C,H,W) tensor")
         if self.metric_backend == "cv2":
             with torch.no_grad():
                 return self._phi_tiles_cv2(features)
@@ -823,54 +808,47 @@ class MorphologicalComplexityAnalyzer(nn.Module):
                 return self._phi_tiles_gpu(features.float())
         return self._phi_tiles_gpu(features.float())
 
+    @torch.no_grad()
     def _phi_tiles_gpu(self, features: torch.Tensor):
-        """Vectorized GPU metric path (see compute_phi_tiles for dispatch)."""
-        B, C, H, W = features.shape
-        # Paper Sec IV-D: tile size defaults to H/8 (8x8 grid); Eq.(12) allows finer
-        # grids for high object density. Rounded to a power of two for the dyadic
-        # box-counting scales (see _tile_size).
-        tile = self._tile_size(H)
-        ht, wt = H // tile, W // tile
-        Hc, Wc = ht * tile, wt * tile  # crop to an exact tile multiple
+        """Describe the exact configured grid, batching equal-size rectangles.
 
-        with torch.no_grad():
-            gray = features[:, :, :Hc, :Wc].mean(dim=1, keepdim=True).float()
-            gray = self._normalize01(gray)
+        Local operators run inside each tile, as in the OpenCV backend. At
+        most four rectangle shapes occur, even for non-divisible dimensions.
+        Normalization is per image, before extracting tiles.
+        """
+        B, _, H, W = features.shape
+        rows, cols = self._grid_bounds(H), self._grid_bounds(W)
+        ht, wt = len(rows) - 1, len(cols) - 1
+        gray = self._normalize01(features.mean(dim=1, keepdim=True).float())
+        groups = {}
+        for i in range(ht):
+            for j in range(wt):
+                shape = (rows[i + 1] - rows[i], cols[j + 1] - cols[j])
+                groups.setdefault(shape, []).append((i, j))
 
-            # Plain Sobel gradients for phi3 (Eq.22 specifies Sobel directly)
-            gx, gy = self._sobel(gray)
+        phi = gray.new_zeros(B, ht, wt, 8)
+        for tile, positions in groups.items():
+            patches = torch.cat([
+                gray[:, :, rows[i]:rows[i + 1], cols[j]:cols[j + 1]]
+                for i, j in positions
+            ], dim=0)
+            gx, gy = self._sobel(patches)
+            edge = self._gpu_canny(patches)
+            binmask = self._binarize(patches)
+            p1 = self._fractal_dimension_tiles(edge, tile) / 2.0
+            p2 = self._lbp_entropy_tiles(patches, tile)
+            p3 = self._gradient_variance_tiles(gx, gy, tile)
+            p4 = edge.mean(dim=(1, 2, 3)).view(-1, 1, 1)
+            p5 = self._contour_complexity_tiles(binmask, tile)
+            values = torch.stack([
+                p1, p2, p3, p4, p5, p1 * p2, p3 ** 2,
+                torch.sqrt((p4 * p5).clamp(min=0))
+            ], dim=-1).reshape(len(positions), B, 8)
+            for index, (i, j) in enumerate(positions):
+                phi[:, i, j] = values[index]
 
-            # Edge map for phi1/phi4: tensorized Canny with Otsu-adaptive
-            # thresholds (Eq.23 / Algorithm 2 input) — blur, NMS, double
-            # threshold, hysteresis. Default 'cv2compat' replicates the cv2
-            # recipe's operator semantics; see _gpu_canny_cv2compat.
-            edge = self._gpu_canny(gray)
-            # Foreground mask for phi5 — default replicates the cv2 recipe's
-            # adaptiveThreshold(GAUSSIAN, 11, 2); see _binarize.
-            binmask = self._binarize(gray)
-
-            phi1 = self._fractal_dimension_tiles(edge, tile) / 2.0  # Df/2 in [0.5,1]
-            phi2 = self._lbp_entropy_tiles(gray, tile)
-            phi3 = self._gradient_variance_tiles(gx, gy, tile)
-            phi4 = F.avg_pool2d(edge, kernel_size=tile, stride=tile).squeeze(1)  # Eq.(23)
-            phi5 = self._contour_complexity_tiles(binmask, tile)
-
-            # Algorithm 1 line 14: phi <- [phi1..phi5, phi1*phi2, phi3^2, sqrt(phi4*phi5)]
-            # (the LaTeX source confirms the 8th feature is sqrt(phi4*phi5))
-            phi = torch.stack(
-                [phi1, phi2, phi3, phi4, phi5,
-                 phi1 * phi2, phi3**2, torch.sqrt(phi4 * phi5 + 1e-12)],
-                dim=-1,
-            )  # (B,ht,wt,8)
-
-        detailed = {
-            "fractal": phi1,
-            "texture": phi2,
-            "gradient": phi3,
-            "edge": phi4,
-            "contour": phi5,
-        }
-        return phi, detailed
+        names = ("fractal", "texture", "gradient", "edge", "contour")
+        return phi, {name: phi[..., i] for i, name in enumerate(names)}
 
     @torch.no_grad()
     def fit_feature_weights(self, batches, max_batches: int = 64):
