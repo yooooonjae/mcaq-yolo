@@ -9,6 +9,74 @@ import numpy as np
 from typing import Optional
 
 
+@torch.no_grad()
+def feature_std_complexity(features, grid_size=8):
+    """Simple baseline: within-tile standard deviation of channel-mean features.
+
+    Normalize by the per-image maximum (flat images map to zero). No labels,
+    morphology, learned combination or changes to the downstream bit mapper.
+    """
+    gray = features.detach().float().mean(1)
+    b, h, w = gray.shape
+    ht, wt = min(grid_size, h), min(grid_size, w)
+    score = gray.new_zeros(b, ht, wt)
+    for i in range(ht):
+        y0, y1 = (i * h + ht - 1) // ht, ((i + 1) * h + ht - 1) // ht
+        for j in range(wt):
+            x0, x1 = (j * w + wt - 1) // wt, ((j + 1) * w + wt - 1) // wt
+            score[:, i, j] = gray[:, y0:y1, x0:x1].flatten(1).std(1, correction=0)
+    return score / score.amax((-2, -1), keepdim=True).clamp_min(1e-8)
+
+
+def interpolate_precision(base: torch.Tensor, progress: float, max_bits: float = 8.) -> torch.Tensor:
+    """Convex precision continuation; its derivative w.r.t. base is progress."""
+    if not 0. <= progress <= 1.:
+        raise ValueError('precision_progress must be finite and in [0,1]')
+    return (1. - progress) * max_bits + progress * base
+
+
+def tile_areas(bits: torch.Tensor, spatial_shape) -> torch.Tensor:
+    """Areas for floor(pixel * tiles / size), including nondivisible edges."""
+    h, w = spatial_shape
+    ht, wt = bits.shape[-2:]
+    rows = torch.div(torch.arange(ht + 1, device=bits.device) * h + ht - 1, ht,
+                     rounding_mode='floor').diff()
+    cols = torch.div(torch.arange(wt + 1, device=bits.device) * w + wt - 1, wt,
+                     rounding_mode='floor').diff()
+    return (rows[:, None] * cols[None, :]).to(bits.dtype)
+
+
+def apply_allocation_policy(bits, spatial_shape, policy='adaptive', uniform_bits=4., seed=0):
+    """Control interventions before continuation/rounding, shared by train/eval.
+
+    Shuffle permutes within equal-area groups independently per batch position.
+    Its local CPU generator does not perturb training/augmentation RNG streams.
+    """
+    if policy == 'adaptive':
+        return bits
+    if policy == 'uniform':
+        return torch.full_like(bits, uniform_bits)
+    areas = tile_areas(bits, spatial_shape)
+    if policy == 'layerwise':
+        mean = (bits * areas).sum((-2, -1), keepdim=True) / areas.sum()
+        return mean.expand_as(bits)
+    if policy != 'shuffle':
+        raise ValueError(f'unknown allocation_policy: {policy}')
+    flat = bits.flatten(1)
+    # Equal areas preserve both the tile histogram and activation element cost.
+    cpu_areas = areas.detach().cpu().flatten()
+    generator = torch.Generator(device='cpu').manual_seed(int(seed))
+    permutations = []
+    for _ in range(bits.shape[0]):
+        order = torch.arange(flat.shape[1])
+        for area in cpu_areas.unique():
+            indices = (cpu_areas == area).nonzero().flatten()
+            order[indices] = indices[torch.randperm(len(indices), generator=generator)]
+        permutations.append(order)
+    order = torch.stack(permutations).to(bits.device)
+    return flat.gather(1, order).reshape_as(bits)
+
+
 class LinearBitMapper(nn.Module):
     """
     Paper Table V / Table VIII 'Linear mapping (no MLP)' ablation configuration:

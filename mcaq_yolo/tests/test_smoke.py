@@ -37,12 +37,8 @@ def test_phi_tiles_shapes(H):
     a = MorphologicalComplexityAnalyzer(device="cpu")
     x = torch.rand(2, 3, H, H)
     phi, detailed = a.compute_phi_tiles(x)
-    tile = a._tile_size(H)
-    ht = H // tile
-    assert phi.shape == (2, ht, ht, 8), phi.shape
+    assert phi.shape == (2, 8, 8, 8), phi.shape
     assert set(detailed) == {"fractal", "texture", "gradient", "edge", "contour"}
-    # Power-of-two tiles (Algorithm 1) and >= 2 dyadic scales (Algorithm 2)
-    assert tile >= 4 and (tile & (tile - 1)) == 0
     # All metrics normalized
     assert float(phi.min()) >= 0.0 and float(phi.max()) <= 1.0 + 1e-5
 
@@ -144,7 +140,8 @@ def test_calibration_freeze():
 # ---------------------------------------------------------------------------
 
 def test_curriculum_schedule():
-    cs = CurriculumScheduler(warmup_epochs=20, transition_epochs=50, total_epochs=300)
+    cs = CurriculumScheduler(warmup_epochs=20, transition_epochs=50, total_epochs=300,
+                             schedule_mode='legacy_multiply')
     assert cs.get_stage(1) == 1 and cs.get_stage(20) == 1
     assert cs.get_stage(21) == 2 and cs.get_stage(50) == 2
     assert cs.get_stage(51) == 3

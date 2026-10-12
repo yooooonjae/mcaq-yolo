@@ -11,10 +11,12 @@ model:
 
 # Dataset settings - YOLOv8 format
 data:
-  # YOLOv8 dataset yaml (contains path / train / val / names)
+  # YOLOv8 dataset yaml (contains path / train / val / optional test / names)
   yaml_path: /path/to/dataset.yaml
   train: images/train  # Relative to the dataset root in the yaml
   val: images/val
+  # test: images/test  # Optional held-out split; otherwise use data YAML's test.
+  # test: null         # Explicitly disable test even when present in data YAML.
 
   img_size: 640
   num_workers: 8
@@ -24,18 +26,30 @@ epochs: 300
 batch_size: 16
 learning_rate: 0.001
 
+# Explicit implementation defaults override imported teacher-checkpoint settings.
+augmentation:
+  mosaic: 1.0
+  mixup: 0.0
+
 # Quantization settings
 quantization:
   min_bits: 2
   max_bits: 8
   target_bits: 4.0
-  grid_size: 8          # tiles per spatial dimension (paper Sec IV-D)
+  grid_sizes: [8, 4, 2] # C3/C4/C5 tiles per axis; 10x10 feature pixels at input 640.
+  # grid_size: 8       # Legacy uniform-grid alternative; omit grid_sizes to use.
+                        # Input-image sample scoring retains a separate 8x8 grid.
   bit_mapping: mlp      # 'mlp' (Eq.13-17) | 'linear' (paper's ablation)
   normalize_complexity: false  # per-image percentile-normalize C before mapping
+  allocation_policy: adaptive # adaptive | uniform | shuffle | layerwise | std
+  smooth_transitions: true # learned gate; false sets m(p)=1
 
 # Curriculum learning (3-stage schedule, paper Fig.3 / Algorithm 3)
 curriculum:
   enabled: true
+  schedule_mode: interpolate # corrected default; legacy_multiply reproduces the old schedule
+  sample_enabled: true
+  precision_enabled: true
   score_backend: train  # 'train' (default: same metric backend the training
                         # hooks use — single source of truth for the
                         # curriculum signal) | 'gpu' | 'cv2' (exact Eq.21-24
@@ -45,7 +59,7 @@ curriculum:
   warmup_epochs: 20     # Stage 1 boundary (paper Table X: Twarm = 20)
   transition_epochs: 50 # Stage 2 boundary (paper Fig.3)
   initial_complexity: 0.2
-  initial_temperature: 10.0
+  initial_temperature: 10.0 # used only by legacy_multiply
   lambda_smooth: 0.1    # Table X lambda2; scale down for finer grids
 
 # Knowledge distillation
@@ -70,6 +84,13 @@ training:
   map_interval: 1  # compute full-val mAP@0.5 every N epochs (best-checkpoint
                    # selection only updates on epochs where mAP is computed;
                    # raise this to amortize NMS+AP cost on large val sets)
+
+# Validation selects the checkpoint; a configured test is evaluated only afterward.
+evaluation:
+  protocol: reference_voc  # all-point AP50 and AP50:95; size AP is unavailable
+  # protocol: coco_bbox   # requires pip install pycocotools; official COCOeval on
+                          # converted ordinary YOLO boxes, original-image size bins.
+                          # Not a full original COCO annotation evaluation.
 
 # Reproducibility (review fix): fixes random/numpy/torch(+CUDA) RNGs before
 # model init and dataloader construction; 'deterministic: true' additionally

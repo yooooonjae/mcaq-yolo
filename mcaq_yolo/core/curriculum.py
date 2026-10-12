@@ -31,7 +31,11 @@ class CurriculumScheduler:
         initial_bits: float = 8.0,
         target_bits: float = 4.0,
         curriculum_type: str = 'exponential',  # 'linear', 'exponential', 'cosine', 'step'
-        lambda_smooth: float = 0.1  # Table X lambda2; scale down for finer grids
+        lambda_smooth: float = 0.1,
+        schedule_mode: str = 'interpolate',
+        sample_enabled: bool = True,
+        precision_enabled: bool = True,
+        min_bits: float = 2.0,
                                     # (Lsmooth sums |db| over tile pairs — a 20x20
                                     # grid has ~7x the terms of the paper's 8x8)
     ):
@@ -48,6 +52,16 @@ class CurriculumScheduler:
             target_bits: Target bit-width
             curriculum_type: Type of curriculum progression
         """
+        if warmup_epochs < 0 or transition_epochs <= warmup_epochs or total_epochs <= 0:
+            raise ValueError('require 0 <= warmup_epochs < transition_epochs and total_epochs > 0')
+        if not 2 <= min_bits <= target_bits <= initial_bits <= 8:
+            raise ValueError('require 2 <= min_bits <= target_bits <= initial_bits <= 8')
+        if schedule_mode not in ('interpolate', 'legacy_multiply'):
+            raise ValueError('unknown precision schedule_mode')
+        self.schedule_mode = schedule_mode
+        self.sample_enabled = sample_enabled
+        self.precision_enabled = precision_enabled
+        self.min_bits = min_bits
         self.warmup_epochs = warmup_epochs
         self.transition_epochs = transition_epochs
         self.total_epochs = total_epochs
@@ -76,6 +90,8 @@ class CurriculumScheduler:
         Returns:
             Stage number in {1, 2, 3}
         """
+        if not self.precision_enabled:
+            return 3
         if epoch <= self.warmup_epochs:
             return 1
         elif epoch <= self.transition_epochs:
@@ -98,6 +114,8 @@ class CurriculumScheduler:
         # the precise spec — Sec IV-C: "the complexity threshold tau_t increases
         # linearly from tau0=0.2 to 1.0 during the warmup phase" — matches
         # Algorithm 3 and is what is implemented here.
+        if not self.sample_enabled or self.warmup_epochs == 0:
+            return 1.0
         if epoch <= self.warmup_epochs:
             # Linear increase during warmup
             progress = epoch / self.warmup_epochs
@@ -118,6 +136,8 @@ class CurriculumScheduler:
         Returns:
             Temperature value
         """
+        if self.schedule_mode != 'legacy_multiply' or not self.precision_enabled:
+            return 1.0
         if self.curriculum_type == 'linear':
             # Linear decay
             progress = min(epoch / self.total_epochs, 1.0)
@@ -159,6 +179,11 @@ class CurriculumScheduler:
         Returns:
             Target bit-width
         """
+        if not self.precision_enabled:
+            return self.target_bits
+        if self.schedule_mode == 'interpolate':
+            r = self.get_precision_progress(epoch)
+            return (1.0 - r) * self.initial_bits + r * self.target_bits
         if epoch < self.warmup_epochs:
             # Start with higher precision
             target = self.initial_bits
@@ -176,6 +201,22 @@ class CurriculumScheduler:
 
         return target
     
+    def get_precision_progress(self, epoch: int) -> float:
+        """Interpolation reaches the learned policy at the transition endpoint.
+
+        The first quantized epoch has r > 0; no multiplicative clipping plateau.
+        Legacy runs pass None to the model and use get_temperature instead.
+        """
+        if not self.precision_enabled:
+            return 1.0
+        return min(1.0, max(0.0, (epoch - self.warmup_epochs) /
+                            (self.transition_epochs - self.warmup_epochs)))
+
+    def model_precision_progress(self, epoch: int):
+        if self.schedule_mode == 'legacy_multiply' and self.precision_enabled:
+            return None
+        return self.get_precision_progress(epoch)
+
     def step(self):
         """Advance to next epoch."""
         self.current_epoch += 1
@@ -186,6 +227,7 @@ class CurriculumScheduler:
             'epoch': self.current_epoch,
             'complexity_threshold': self.get_complexity_threshold(self.current_epoch),
             'temperature': self.get_temperature(self.current_epoch),
+            'precision_progress': self.model_precision_progress(self.current_epoch),
             'target_bits': self.get_target_bits(self.current_epoch)
         }
     
@@ -218,7 +260,7 @@ class CurriculumScheduler:
         # transition stage, so the flat-map reward cannot dominate before
         # Ldet's tile-wise signal exists.
         span = max(1, self.transition_epochs - self.warmup_epochs)
-        ramp = min(1.0, max(0.0, (epoch - self.warmup_epochs) / span))
+        ramp = self.get_precision_progress(epoch)
 
         weights = {
             'detection': 1.0,

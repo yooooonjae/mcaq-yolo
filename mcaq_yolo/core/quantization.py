@@ -53,12 +53,16 @@ class QuantizationParameters:
         Returns:
             scale, zero_point for quantization
         """
-        # Avoid division by zero
+        # Include zero before choosing the scale. Clamping a zero point from
+        # an all-positive/all-negative range otherwise clips the whole channel
+        # (a constant nonzero channel previously collapsed to ~0).
+        x_min = x_min.float().clamp(max=0)
+        x_max = x_max.float().clamp(min=0)
         x_range = x_max - x_min
         x_range = torch.clamp(x_range, min=1e-8)
         
         scale = x_range / (self.qmax - self.qmin)
-        zero_point = self.qmin - x_min / scale
+        zero_point = torch.round(self.qmin - x_min / scale)
         
         # Clamp zero_point to valid range
         zero_point = torch.clamp(zero_point, self.qmin, self.qmax)
@@ -304,10 +308,11 @@ class SpatialAdaptiveQuantization(nn.Module):
         loading and be silently dropped under strict=False (observed when
         loading outputs/coco128_run30/best.pt).
         """
-        for name in ('running_min', 'running_max'):
+        for name in ('running_min', 'running_max', 'calibration_histogram'):
             key = prefix + name
             if key in state_dict and getattr(self, name) is None:
-                setattr(self, name, torch.zeros_like(state_dict[key]))
+                setattr(self, name, torch.zeros_like(
+                    state_dict[key], device=self.stats_frozen.device))
         super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
                                       missing_keys, unexpected_keys, error_msgs)
 
@@ -315,6 +320,14 @@ class SpatialAdaptiveQuantization(nn.Module):
         """Freeze calibration statistics (paper Sec IV-D: EMA over 1,000
         calibration images, then frozen for scale/zero-point computation)."""
         self.stats_frozen = torch.tensor(True, device=self.stats_frozen.device)
+
+    def reset_calibration(self):
+        """Begin a new calibration run, discarding previous frozen statistics."""
+        self.running_min = None
+        self.running_max = None
+        self.calibration_histogram = None
+        self.num_batches_tracked.zero_()
+        self.stats_frozen.fill_(False)
 
     def update_running_stats(self, x: torch.Tensor):
         """
@@ -618,6 +631,15 @@ class SpatialAdaptiveQuantization(nn.Module):
         Returns:
             Spatially quantized tensor
         """
+        if x.dim() != 4 or not x.is_floating_point() or any(s == 0 for s in x.shape):
+            raise ValueError("x must be a nonempty floating-point (B,C,H,W) tensor")
+        if (bit_map.dim() != 3 or bit_map.shape[0] != x.shape[0]
+                or any(s == 0 for s in bit_map.shape)):
+            raise ValueError("bit_map must be nonempty (B,H_tiles,W_tiles) with matching batch")
+        if bit_map.device != x.device:
+            raise ValueError("bit_map and x must be on the same device")
+        if not bool(torch.isfinite(bit_map).all() & (bit_map >= 2).all() & (bit_map <= 8).all()):
+            raise ValueError("bit_map must contain finite values in [2,8]")
         if training is None:
             training = self.training
         
@@ -628,7 +650,10 @@ class SpatialAdaptiveQuantization(nn.Module):
             return self._forward_pytorch(x, bit_map, training)
         
         # For Inference: Use CUDA acceleration if available
-        if HAS_CUDA and x.is_cuda:
+        # The fused kernel implements minmax + ordinary rounding only.
+        # Other calibration/rounding modes must retain their PyTorch semantics.
+        if (HAS_CUDA and x.is_cuda and self.calibration_mode == 'minmax'
+                and self.learned_rounding is None):
             return self._forward_cuda(x, bit_map)
         else:
             return self._forward_pytorch(x, bit_map, training)
@@ -669,14 +694,15 @@ class SpatialAdaptiveQuantization(nn.Module):
         if self.smooth_transitions and self.soft_mask is not None:
             m = self.soft_mask(bit_map, x).float().contiguous()
 
-        return mcaq_cuda_ops.spatial_quantize(
-            x.contiguous(),
+        result = mcaq_cuda_ops.spatial_quantize(
+            x.float().contiguous(),
             bit_map.float().contiguous(),
             x_min.float().contiguous(),
             x_max.float().contiguous(),
             tile_h, tile_w,
             m,
         )
+        return result.to(x.dtype)
 
     def _forward_pytorch(self, x: torch.Tensor, bit_map: torch.Tensor, training: bool) -> torch.Tensor:
         """Original PyTorch forward pass (slow, but differentiable)."""
@@ -743,7 +769,7 @@ class SpatialAdaptiveQuantization(nn.Module):
             m = self.soft_mask(bit_map, x)
             x_quantized = x_quantized * m
 
-        return x_quantized
+        return x_quantized.to(x.dtype)
     
     def extra_repr(self) -> str:
         """Extra representation for printing."""
@@ -752,5 +778,3 @@ class SpatialAdaptiveQuantization(nn.Module):
             f'smooth_transitions={self.smooth_transitions}, '
             f'per_channel={self.per_channel}'
         )
-
-

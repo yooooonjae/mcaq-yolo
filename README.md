@@ -16,7 +16,8 @@ MCAQ-YOLO introduces a spatial quantization framework for object detection that 
 - **Morphological Complexity Analysis**: Five tile-wise metrics fused by a learnable MLP (exact OpenCV path for offline scoring, vectorized GPU surrogates for training)
 - **Complexity-to-Bit Mapping**: Learnable monotonic MLP (paper Eq.13-17) or a parameter-free linear mapper (the paper's ablation baseline)
 - **Spatial Adaptive Quantization**: Tile-wise mixed precision (2-8 bits) applied to the backbone C3/C4/C5 feature maps via forward hooks, with a learned spatially-smoothed soft mask (Eq.19)
-- **Curriculum Learning**: 3-stage schedule (high-precision warm-up → transition → full MCAQ) with temperature annealing and complexity-ordered data sampling
+- **Level-specific grids**: C3/C4/C5 use 8×8, 4×4 and 2×2 tiles, giving 10×10 feature pixels per tile at 640×640 input; old single-grid configurations remain available.
+- **Curriculum Learning**: high-precision warm-up → bounded precision interpolation → full MCAQ, with independent sample-admission and precision controls
 - **Knowledge Distillation**: Logit-level and feature-level matching against an FP32 teacher
 - **Hardware-Aware Design**: Custom CUDA kernel for inference (with an automatic pure-PyTorch fallback) and a TensorRT plugin reference
 
@@ -60,7 +61,40 @@ mcaq-yolo-train \
     --output-dir outputs/experiment_1
 ```
 
-The best weights (lowest validation loss) are saved to `<output_dir>/best.pt`.
+The best weights (highest quantized Stage-3 validation mAP@0.5) are saved to
+`<output_dir>/best.pt`. Runs ending before Stage 3 save the final model instead.
+
+### Corrected schedule and matched controls
+
+The default now uses `b(t) = (1-r)*8 + r*b_base`, with `r` increasing from
+0 to 1 over epochs 21–50. Its target follows the same interpolation to four
+bits, eliminating the old multiply-and-clip saturation plateau. The explicit
+`legacy_multiply` mode remains available for comparison.
+
+```bash
+python -m mcaq_yolo.experiments --config configs/train_config.yaml \
+  --data /data/cse/data.yaml --student /models/student_initial.pt \
+  --teacher /models/teacher.pt --output-dir outputs/controls --seeds 0 1 2 3 4
+```
+
+This runs the 2×2 curriculum experiment plus uniform, shuffled, gate-off,
+layerwise, feature-standard-deviation, and legacy controls. Every run saves
+actual per-level bit/descriptor diagnostics, source/config/checkpoint provenance,
+and endpoint evaluation. Validation selects the checkpoint; a configured held-out
+test split is evaluated afterward. Without a test split, results are explicitly
+validation-only. Actual processed-image counts, optimizer updates and training
+wall time accompany AP50 and AP50:95. The optional `coco_bbox` protocol uses
+COCOeval on converted YOLO boxes and reports original-image size AP; it requires
+`pip install pycocotools` and is distinct from full COCO annotation evaluation.
+Incompatible splits and metric protocols are separated during aggregation.
+See [the protocol and exact-budget paired shuffle](docs/controlled_experiments.md).
+Historical paper accuracy, W4 file sizes and deployment FPS have **not** been
+remeasured using this corrected reference implementation.
+The [original manuscript-reported settings](docs/original_experiment_settings.yaml)
+are preserved as a provenance record, not an executable reproduction configuration.
+The author clarified that the original 151 FPS CSE result was **live**, including
+current-image analysis and bit-map construction. It was not a precomputed-map
+replay result. That measurement does not benchmark this corrected implementation.
 
 ### Inference
 ```bash
@@ -79,8 +113,8 @@ mcaq-yolo-infer \
 
 ### Tests
 ```bash
-# From the repo root (CPU-friendly smoke tests)
-python -m pytest mcaq_yolo/tests/test_smoke.py -v
+# From the repo root (CPU-friendly tests; CUDA tests require the extension)
+python -m pytest -v
 ```
 
 ## 📊 Model Architecture
@@ -129,17 +163,22 @@ quantization:
   min_bits: 2
   max_bits: 8
   target_bits: 4.0
-  grid_size: 8          # tiles per spatial dimension
+  grid_sizes: [8, 4, 2] # tile counts per axis, in C3/C4/C5 order
   bit_mapping: mlp      # 'mlp' (Eq.13-17) | 'linear' (paper's ablation)
   normalize_complexity: false
+  allocation_policy: adaptive
+  smooth_transitions: true
 
 # Curriculum learning (3-stage schedule)
 curriculum:
   enabled: true
+  schedule_mode: interpolate
+  sample_enabled: true
+  precision_enabled: true
   warmup_epochs: 20     # Stage 1 boundary (Twarm)
   transition_epochs: 50 # Stage 2 boundary
   initial_complexity: 0.2
-  initial_temperature: 10.0
+  initial_temperature: 10.0 # legacy_multiply only
   lambda_smooth: 0.1
 
 # Knowledge distillation
@@ -180,7 +219,7 @@ import torch
 from mcaq_yolo.core.morphology import MorphologicalComplexityAnalyzer
 
 analyzer = MorphologicalComplexityAnalyzer(
-    grid_size=8,           # tiles per spatial dimension (8x8 grid)
+    grid_size=8,           # default input-image grid; feature calls can override it
     device='cuda',
     metric_backend='gpu',  # 'gpu' (vectorized, training) | 'cv2' (exact, offline)
 )
@@ -238,6 +277,57 @@ python -m mcaq_yolo.scripts.m4_variation_gain \
     --ckpt-uniform outputs/<uniform>/best.pt \
     --data <dataset.yaml> --val-rel images/val
 ```
+
+### Live inference and optional map reuse
+
+The default forward pass computes morphology from the current C3/C4/C5 feature maps.
+Original paper throughput was measured in live mode; the following optional API
+serves repeated-input and controlled spatial-placement experiments.
+For repeated inference on an already known, identically preprocessed input,
+the model can explicitly consume precomputed per-scale maps:
+
+```python
+model.eval()
+model.calibrate(calibration_loader, num_images=1000)
+bit_maps = model.precompute_bit_maps(images)
+# Optional persistence: torch.save([b.cpu() for b in bit_maps], "bit_maps.pt")
+with torch.inference_mode():
+    predictions, aux = model(images, precomputed_bit_maps=bit_maps)
+```
+
+`images` is the preprocessed NCHW tensor used to compute the maps. Regenerate
+maps after changing the input, batch ordering, preprocessing, weights or
+calibration. This API skips morphology and bit mapping; the learned soft mask
+still uses the current activations. It rejects training, non-unit temperature,
+missing scales and invalid bit values. `aux['complexity_map']` contains `None`
+for each scale on this path. It does not implicitly reuse maps on novel images
+or implement the paper's approximate streaming LSH cache.
+
+### Spatial quantization corrections
+
+- `grid_size=8` now means eight tiles along each spatial axis, capped by the
+  feature dimensions for tiny maps. With the revised default `grid_sizes=[8,4,2]`,
+  counts differ across C3/C4/C5. Both morphology backends retain all border
+  pixels and use the same proportional partition as nearest-neighbor bit-map
+  upsampling. Dyadic box counting operates inside rectangular tiles and includes
+  partial boundary boxes; tiles smaller than four pixels along either axis use
+  the documented fractal fallback of 1.
+- Affine quantization includes zero in the calibration range and uses an integer
+  zero point. Constant positive/negative channels no longer collapse to zero.
+- CUDA uses the same tile ownership and ties-to-even rounding as PyTorch. The
+  wrapper supplies float32 kernel inputs and restores the activation dtype;
+  non-minmax calibration and learned rounding retain the PyTorch path.
+- Recalibration resets frozen statistics, respects the image limit and restores
+  mixed train/eval modes. Saved calibration histograms now load correctly.
+- These corrections change numerical behavior relative to v0.2.2. Existing
+  checkpoints can load, but their grids, calibration and outputs must not be
+  treated as numerically identical. Curriculum scores from the old layout are
+  invalidated automatically. Regenerate precomputed maps and recalibrate when
+  migrating; evaluate the changed implementation before comparing experiments.
+
+The regression suite checks numerical behavior and detector integration; it
+does not remeasure the paper's accuracy, compressed size or FPS. The CUDA and
+TensorRT paths still need a compatible build/runtime for hardware validation.
 
 ## 📁 Project Structure
 ```

@@ -1,6 +1,8 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>  // at::cuda::getCurrentCUDAStream
 #include <c10/util/Optional.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
 #include <vector>
 
 // CUDA forward declaration
@@ -27,6 +29,16 @@ torch::Tensor spatial_quantize_cuda(
     int tile_h, int tile_w,
     c10::optional<torch::Tensor> mask
 ) {
+    TORCH_CHECK(input.is_cuda() && input.scalar_type() == at::kFloat && input.is_contiguous(),
+                "input must be contiguous CUDA float32");
+    TORCH_CHECK(input.dim() == 4 && input.numel() > 0, "input must be nonempty NCHW");
+    TORCH_CHECK(bit_map.dim() == 3 && bit_map.numel() > 0 && bit_map.size(0) == input.size(0),
+                "bit_map must be nonempty (N,Ht,Wt) with matching batch");
+    for (const auto& tensor : {bit_map, min_vals, max_vals}) {
+        TORCH_CHECK(tensor.device() == input.device() && tensor.scalar_type() == at::kFloat
+                    && tensor.is_contiguous(), "quantization tensors must be contiguous float32 on the input device");
+    }
+    c10::cuda::CUDAGuard device_guard(input.device());
     auto output = torch::empty_like(input);
 
     int N = input.size(0);
@@ -41,7 +53,10 @@ torch::Tensor spatial_quantize_cuda(
 
     const float* mask_ptr = nullptr;
     if (mask.has_value() && mask->defined()) {
-        TORCH_CHECK(mask->numel() == static_cast<int64_t>(N) * H * W,
+        TORCH_CHECK(mask->device() == input.device() && mask->scalar_type() == at::kFloat
+                    && mask->is_contiguous(), "mask must be contiguous float32 on the input device");
+        TORCH_CHECK(mask->dim() == 4 && mask->size(0) == N && mask->size(1) == 1
+                    && mask->size(2) == H && mask->size(3) == W,
                     "mask must be (N, 1, H, W)");
         mask_ptr = mask->data_ptr<float>();
     }
@@ -63,6 +78,7 @@ torch::Tensor spatial_quantize_cuda(
         n_tiles_h, n_tiles_w,
         at::cuda::getCurrentCUDAStream()
     );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 
     return output;
 }
