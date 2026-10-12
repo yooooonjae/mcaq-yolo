@@ -79,9 +79,18 @@ python -m mcaq_yolo.experiments --config configs/train_config.yaml \
 This runs the 2×2 curriculum experiment plus uniform, shuffled, gate-off,
 layerwise, feature-standard-deviation, and legacy controls. Every run saves
 actual per-level bit/descriptor diagnostics, source/config/checkpoint provenance,
-and endpoint evaluation. See [the protocol and exact-budget paired shuffle](docs/controlled_experiments.md).
+and endpoint evaluation. Validation selects the checkpoint; a configured held-out
+test split is evaluated afterward. Without a test split, results are explicitly
+validation-only. Actual processed-image counts, optimizer updates and training
+wall time accompany AP50 and AP50:95. The optional `coco_bbox` protocol uses
+COCOeval on converted YOLO boxes and reports original-image size AP; it requires
+`pip install pycocotools` and is distinct from full COCO annotation evaluation.
+Incompatible splits and metric protocols are separated during aggregation.
+See [the protocol and exact-budget paired shuffle](docs/controlled_experiments.md).
 Historical paper accuracy, W4 file sizes and deployment FPS have **not** been
 remeasured using this corrected reference implementation.
+The [original manuscript-reported settings](docs/original_experiment_settings.yaml)
+are preserved as a provenance record, not an executable reproduction configuration.
 
 ### Inference
 ```bash

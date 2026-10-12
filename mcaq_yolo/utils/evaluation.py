@@ -83,10 +83,10 @@ def _ap_from_pr(recall: np.ndarray, precision: np.ndarray,
     """
     interp='voc' (default, backwards compatible): all-point VOC-2010 area
     under the monotone precision envelope.
-    interp='coco' (REVIEW FIX): COCO's official 101-point linear
-    interpolation — use this whenever numbers are compared against
-    pycocotools / Ultralytics validators; the two differ by ~0.001-0.003 on
-    dense PR curves, which matters at paper-table precision.
+    interp='coco': retained legacy 101-point linear approximation. This
+    is not COCOeval's recall sampling or matching protocol. Use
+    protocol_evaluation.evaluate_detections(protocol='coco_bbox') for the
+    official COCOeval implementation on converted box annotations.
     """
     r = np.concatenate(([0.0], recall, [1.0]))
     p = np.concatenate(([1.0], precision, [0.0]))
@@ -119,9 +119,9 @@ def compute_map(
     if iou_thresholds is None:
         iou_thresholds = np.linspace(0.5, 0.95, 10).tolist()
 
-    # COCO treatment: evaluate the union of GT classes and detected classes —
-    # a class that only ever appears in detections (zero GT anywhere) must
-    # contribute AP = 0.0 rather than being silently dropped from the mean.
+    # Legacy reference behavior: include detected-only classes with AP=0.
+    # COCOeval instead excludes categories without ground truth; the explicit
+    # coco_bbox protocol handles that distinct evaluation convention.
     gt_classes = {int(c) for t in targets for c in t[:, 0].tolist()}
     det_classes = {int(c) for d in detections if len(d) for c in d[:, 5].tolist()}
     classes = sorted(gt_classes | det_classes)

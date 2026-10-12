@@ -22,7 +22,19 @@ the historical plateau and target mismatch for comparison. It is not the default
 
 Use the same local student and teacher checkpoints for every variant. The YAML
 controls optimizer, augmentation defaults, image size, batch size and epochs.
-The data YAML supplies `path`, `train`, `val`, and `names` in YOLO format.
+Mosaic defaults to 1.0 and MixUp to 0.0 even when the imported teacher checkpoint
+contains other values; set `augmentation` explicitly to override them. Other
+augmentation parameters inherit Ultralytics/teacher settings unless overridden.
+The full effective detection-augmentation settings are saved as
+`resolved_augmentation` in the resolved config and manifest.
+The data YAML supplies `path`, `train`, `val`, optional `test`, and `names` in YOLO
+format. Validation is used for checkpoint selection. A configured test split is
+evaluated only after training and loading the selected checkpoint. Set `data.test`
+in the training config to override the data YAML's test path, or set it to `null`
+to explicitly disable test evaluation. `--data` takes all split paths from the new
+data YAML. Test image paths must be disjoint from both train and validation;
+resolved path overlap is rejected (this is not an image-content duplicate check).
+Without a test split, final results are explicitly marked `validation_only`.
 
 ```bash
 python -m mcaq_yolo.experiments --config configs/train_config.yaml \
@@ -53,9 +65,16 @@ KD, initialization, batch size, optimizer and training duration are inherited.
 The four curriculum variants isolate the two switches. Precision-off also removes
 its high-precision warm-up and smoothness ramp. Gate-off resets the data RNG after
 model construction so omitted gate parameters do not change augmentation seeds.
-Sample admission necessarily changes the number of optimizer updates; the history
-records samples and epochs. This is an equal-epoch comparison, not an assertion
-of equal sample exposure or equal wall-clock cost.
+Sample admission changes training effort. Each history row records observed
+`processed_samples`, actual `optimizer_updates`, and `training_wall_seconds` under
+`train`, plus cumulative totals under `training_effort`. Samples count batch images
+actually processed, including partial batches; mosaic source images are not separate
+sample exposures. Optimizer post-step hooks exclude AMP overflow skips from updates.
+The wall timer synchronizes CUDA/MPS before and after each training epoch and includes
+training data loading and host work; it excludes validation, checkpoint I/O, initial
+complexity scoring, and final test evaluation. CPU timing uses the same wall clock.
+Totals are also saved in `result.json` and the collector. This is an equal-epoch
+comparison, not an assertion of equal sample exposure, update count, or elapsed cost.
 
 Shuffle uses a local seeded generator and equal-area groups, preserving both the
 tile histogram and element cost of each incoming map, including 20x20 features
@@ -85,8 +104,13 @@ distinct from retraining with shuffle. The reference model must be adaptive.
 Every run saves `manifest.json` (configuration, package versions, source hashes,
 available input hashes), `resolved_config.yaml`, `history.jsonl`, `best.pt`,
 `last.pt`, and `result.json` (selected checkpoint hash and evaluation at the final
-inference policy). Selection uses final-stage validation mAP50. Short smoke runs
-are marked through `final_policy_trained`; they do not establish accuracy.
+inference policy). `dataset_index.json` includes every configured split, including
+test, and label hashes. Selection uses final-stage validation mAP50. The result records
+`selection_split=val`, selection method, `evaluation_split`, `evaluation_scope`, and
+the evaluator `protocol`/`protocol_details`. If the selection regime is never reached,
+the final-epoch fallback is labeled explicitly. Short smoke runs are marked through
+`final_policy_trained`; they do not establish accuracy. `evaluation.detection_loss`
+names the selected split's loss; `val_loss` is retained as a compatibility alias.
 
 `history.jsonl` includes actual per-level minimum/mean/maximum bits, continuous
 8-bit saturation fraction, rounded integer histograms, policy mean, element mean,
@@ -107,8 +131,28 @@ python -m mcaq_yolo.experiments --output-dir outputs/schedule_controls --collect
 ```
 
 The collector writes seed-level `summary.csv` and `aggregate.json` (mean and sample
-standard deviation). mAP50 is in [0,1] and uses the reference evaluator's all-point
-AP at IoU 0.5. It does not report BCa intervals or manufacture deployment FPS.
+standard deviation, with per-metric contributing counts). Aggregates separate
+variant, evaluation split/scope, protocol, and protocol details, preventing test
+and validation-only results or incompatible metric definitions from being pooled.
+Old result files are labeled validation-only/reference-VOC; unavailable historical
+effort and size metrics remain null. The collector reports AP50, AP50:95, size AP,
+and measured training effort. It does not report BCa intervals or deployment FPS.
+
+`evaluation.protocol: reference_voc` is the default. It retains the existing
+all-point interpolated reference evaluator and returns AP50 and the mean over
+IoUs 0.50:0.05:0.95, both in [0,1]. It is not the official COCO evaluator; size AP
+is null. `evaluation.protocol: coco_bbox` requires `pip install pycocotools` and
+uses official COCOeval matching, 101 recall samples, standard area bins, and
+maximum detections [1,10,100]. Both paths share the decoded predictions (confidence
+threshold 0.001, NMS IoU 0.65, at most 300 predictions before COCOeval's limit).
+For COCO evaluation, predictions and targets are restored from letterboxed input
+coordinates to original-image pixels using `ori_shape` and `ratio_pad`; missing
+geometry fails explicitly. Size AP therefore uses original-image bbox area.
+Undefined size bins remain null. These are converted ordinary YOLO bounding-box
+annotations: original COCO crowd/ignore flags and segmentation areas are absent.
+The metrics are labeled `coco_bbox`, not a reproduction of a full-annotation COCO
+benchmark score. Matching the original dataset and annotation protocol still
+requires the original evaluation assets.
 The historical paper metrics have not been remeasured with this corrected code;
 the original benchmark dataset, checkpoints and deployment engine are required
 before associating new runs with those table rows.

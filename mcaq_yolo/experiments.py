@@ -79,9 +79,21 @@ def collect_results(root):
         result = json.loads(path.read_text(encoding='utf-8'))
         manifest = json.loads(path.with_name('manifest.json').read_text(encoding='utf-8'))
         cfg = manifest['config']
-        bits = result['evaluation'].get('bit_diagnostics', {})
+        evaluation = result['evaluation']
+        bits = evaluation.get('bit_diagnostics', {})
+        effort = result.get('training_effort', {})
         rows.append(dict(variant=cfg['experiment_variant'], seed=cfg['seed'],
-                         mAP50=result['evaluation']['mAP50'],
+                         mAP50=evaluation['mAP50'], mAP50_95=evaluation.get('mAP50_95'),
+                         AP_small=evaluation.get('AP_small'), AP_medium=evaluation.get('AP_medium'),
+                         AP_large=evaluation.get('AP_large'),
+                         selection_split=result.get('selection_split', 'val'),
+                         evaluation_split=result.get('evaluation_split', 'val'),
+                         evaluation_scope=result.get('evaluation_scope', 'validation_only'),
+                         evaluation_protocol=evaluation.get('protocol', 'reference_voc'),
+                         protocol_details=json.dumps(evaluation.get('protocol_details', {}), sort_keys=True),
+                         processed_samples=effort.get('processed_samples'),
+                         optimizer_updates=effort.get('optimizer_updates'),
+                         training_wall_seconds=effort.get('training_wall_seconds'),
                          policy_mean_bits=bits.get('policy_mean_bits'),
                          element_mean_bits=bits.get('element_mean_bits'),
                          target_gap=bits.get('target_gap'),
@@ -93,11 +105,26 @@ def collect_results(root):
             writer.writeheader()
             writer.writerows(rows)
         aggregates = {}
-        for variant in sorted({r['variant'] for r in rows}):
-            values = [r['mAP50'] for r in rows if r['variant'] == variant and r['schedule_completed']]
-            if values:
-                aggregates[variant] = dict(n=len(values), mean_mAP50=statistics.mean(values),
-                                          std_mAP50=statistics.stdev(values) if len(values) > 1 else None)
+        # Keep validation-only results and distinct metric definitions separate.
+        group_fields = ('variant', 'evaluation_split', 'evaluation_scope', 'evaluation_protocol', 'protocol_details')
+        groups = sorted({tuple(row[key] for key in group_fields) for row in rows})
+        metric_fields = ('mAP50', 'mAP50_95', 'AP_small', 'AP_medium', 'AP_large',
+                         'processed_samples', 'optimizer_updates', 'training_wall_seconds')
+        for group in groups:
+            members = [row for row in rows if tuple(row[key] for key in group_fields) == group
+                       and row['schedule_completed']]
+            if not members:
+                continue
+            aggregate = dict(zip(group_fields, group))
+            aggregate['protocol_details'] = json.loads(aggregate['protocol_details'])
+            aggregate['n'] = len(members)
+            for metric in metric_fields:
+                values = [row[metric] for row in members if row[metric] is not None]
+                aggregate[f'n_{metric}'] = len(values)
+                aggregate[f'mean_{metric}'] = statistics.mean(values) if values else None
+                aggregate[f'std_{metric}'] = statistics.stdev(values) if len(values) > 1 else None
+            key = '/'.join(group[:4]) + '/' + hashlib.sha256(group[4].encode()).hexdigest()[:8]
+            aggregates[key] = aggregate
         Path(root, 'aggregate.json').write_text(json.dumps(aggregates, indent=2), encoding='utf-8')
     return rows
 
@@ -154,7 +181,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', default='configs/train_config.yaml')
     parser.add_argument('--output-dir', required=True)
-    parser.add_argument('--data', help='YOLO dataset YAML; its train/val entries take precedence')
+    parser.add_argument('--data', help='YOLO dataset YAML; its train/val/test entries take precedence')
     parser.add_argument('--student', help='local student .pt or YOLO model name')
     parser.add_argument('--teacher', help='local teacher .pt')
     parser.add_argument('--device')
@@ -177,7 +204,7 @@ def main(argv=None):
     base = yaml.safe_load(Path(args.config).read_text(encoding='utf-8'))
     if args.data:
         base.setdefault('data', {})['yaml_path'] = str(Path(args.data).resolve())
-        for key in ('train', 'val'):
+        for key in ('train', 'val', 'test'):
             base['data'].pop(key, None)
     for key, value in [('name', args.student), ('teacher_path', args.teacher)]:
         if value:
@@ -194,12 +221,18 @@ def main(argv=None):
         base['output_dir'] = str(root)
         trainer = Trainer(base)
         trainer.model.load_state_dict(torch.load(args.paired_checkpoint, map_location=trainer.device, weights_only=True))
-        write_manifest(trainer.config, root, trainer.model,
-                       {'train': trainer.train_dataset, 'val': trainer.val_dataset})
-        reference = trainer.evaluate(precision_progress=1.)
-        shuffled = trainer.evaluate(precision_progress=1., paired_shuffle=True)
+        datasets = {'train': trainer.train_dataset, 'val': trainer.val_dataset}
+        if trainer.test_dataset is not None:
+            datasets['test'] = trainer.test_dataset
+        write_manifest(trainer.config, root, trainer.model, datasets)
+        split = 'test' if trainer.test_loader is not None else 'val'
+        reference = trainer.evaluate(precision_progress=1., split=split)
+        shuffled = trainer.evaluate(precision_progress=1., paired_shuffle=True, split=split)
+        delta = (shuffled['mAP50'] - reference['mAP50']
+                 if shuffled['mAP50'] is not None and reference['mAP50'] is not None else None)
         result = dict(checkpoint_sha256=file_hash(args.paired_checkpoint), reference=reference,
-                      shuffled=shuffled, delta_mAP50=shuffled['mAP50'] - reference['mAP50'])
+                      shuffled=shuffled, delta_mAP50=delta, evaluation_split=split,
+                      evaluation_scope='held_out_test' if split == 'test' else 'validation_only')
         (root / 'paired_result.json').write_text(json.dumps(result, indent=2), encoding='utf-8')
         return
     for variant in args.variants:

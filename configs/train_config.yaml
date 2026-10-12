@@ -11,10 +11,12 @@ model:
 
 # Dataset settings - YOLOv8 format
 data:
-  # YOLOv8 dataset yaml (contains path / train / val / names)
+  # YOLOv8 dataset yaml (contains path / train / val / optional test / names)
   yaml_path: /path/to/dataset.yaml
   train: images/train  # Relative to the dataset root in the yaml
   val: images/val
+  # test: images/test  # Optional held-out split; otherwise use data YAML's test.
+  # test: null         # Explicitly disable test even when present in data YAML.
 
   img_size: 640
   num_workers: 8
@@ -23,6 +25,11 @@ data:
 epochs: 300
 batch_size: 16
 learning_rate: 0.001
+
+# Explicit implementation defaults override imported teacher-checkpoint settings.
+augmentation:
+  mosaic: 1.0
+  mixup: 0.0
 
 # Quantization settings
 quantization:
@@ -75,6 +82,13 @@ training:
   map_interval: 1  # compute full-val mAP@0.5 every N epochs (best-checkpoint
                    # selection only updates on epochs where mAP is computed;
                    # raise this to amortize NMS+AP cost on large val sets)
+
+# Validation selects the checkpoint; a configured test is evaluated only afterward.
+evaluation:
+  protocol: reference_voc  # all-point AP50 and AP50:95; size AP is unavailable
+  # protocol: coco_bbox   # requires pip install pycocotools; official COCOeval on
+                          # converted ordinary YOLO boxes, original-image size bins.
+                          # Not a full original COCO annotation evaluation.
 
 # Reproducibility (review fix): fixes random/numpy/torch(+CUDA) RNGs before
 # model init and dataloader construction; 'deterministic: true' additionally
